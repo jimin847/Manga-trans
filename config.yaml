@@ -1,0 +1,43 @@
+# manga_pipeline_v2 configuration
+# YOLO detection + VLM OCR separated pipeline
+
+comfyui:
+  base_url: "http://127.0.0.1:8188"
+
+models:
+  text_segmenter: "/Users/bagjimin/Documents/ComfyUI/models/ultralytics/segm/comic-text-segmenter.pt"
+  bubble_detector: "/Users/bagjimin/Documents/ComfyUI/models/ultralytics/bbox/comic-speech-bubble-detector.pt"
+
+yolo:
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  device: "mps"  # m1 GPU
+
+ocr:
+  provider: "openrouter"
+  model: "qwen/qwen3-vl-8b-instruct"
+  crop_upscale: 2
+  max_workers: 4
+
+translation:
+  provider: "openrouter"
+  # google/gemini-2.5-flash → 일일 할당량 소진 시 OpenRouter 무료 모델로 fallback
+  model: "openai/gpt-oss-120b:free"
+  target_lang: "ko"
+
+inpainting:
+  flat_fill: true  # 흰 말풍선은 flat fill (fast)
+  lama_fallback: true  # 톤 말풍선은 LaMa 인페인팅
+  min_bubble_size: 500  # px², 이보다 작은 말풍선 무시
+
+output:
+  base_dir: "/Users/bagjimin/dev/Manga-trans/output"
+  debug_overlay: false
+  save_crops: false
+  save_masks: false
+
+qa:
+  enabled: false  # 파이프라인 내 자동 QA 검증 (true 시 각 페이지 완료 후 검증)
+  report_dir: ""  # 비우면 output.base_dir 사용
+  warn_threshold: 40  # 번역覆盖率(%) 미만 시 warn
+  bad_threshold: 10   # 번역覆盖率(%) 미만 시 bad
