@@ -53,9 +53,17 @@ cover/
 
 # Translation Output & Cache
 output/
+artifacts/
+output_cli_smoke*/
+output_inpaint_*/
+output_verify_*/
+output_pp_ocrv6_match/
 cache.json
 .batch_progress.json
 .pytest_cache/
+
+# Downloaded model weights
+models/
 
 # OS files
 .DS_Store

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Manga-trans Dashboard Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-app: #111215;
+    --bg-surface: #17181c;
+    --bg-element: #1f2126;
+    --bg-element-hover: #26282f;
+    --border: #292b32;
+    --text-primary: #ededed;
+    --text-secondary: #8d929a;
+    --text-tertiary: #5d6169;
+    --primary: #ffffff;
+    --primary-bg: #2d3039;
+    --accent: #4e82ee;
+    --success: #38c172;
+    --error: #e35d6a;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background-color: var(--bg-app);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Top Bar */
+  header {
+    height: 52px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    background-color: var(--bg-app);
+  }
+  .app-title {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .app-title span {
+    color: var(--text-tertiary);
+    font-weight: 400;
+  }
+  .server-status {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .indicator-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: var(--success);
+  }
+
+  /* Main Container */
+  main {
+    max-width: 800px;
+    margin: 40px auto;
+    padding: 0 24px;
+  }
+
+  /* Segmented preview switcher for mockup review */
+  .mockup-bar {
+    display: flex;
+    gap: 4px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: 4px;
+    border-radius: 6px;
+    width: fit-content;
+    margin: 0 auto 32px;
+  }
+  .mockup-tab {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .mockup-tab.active {
+    background: var(--bg-element);
+    color: var(--text-primary);
+  }
+
+  /* Panel Views */
+  .view-panel {
+    display: none;
+  }
+  .view-panel.active {
+    display: block;
+  }
+
+  /* File Drop Zone */
+  .drop-zone {
+    border: 1px dashed var(--border);
+    background: var(--bg-surface);
+    border-radius: 8px;
+    padding: 48px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background-color 0.15s;
+  }
+  .drop-zone:hover {
+    border-color: var(--text-secondary);
+    background: var(--bg-element);
+  }
+  .drop-title {
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+  }
+  .drop-subtitle {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  /* Folder List */
+  .folder-list {
+    margin-top: 24px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-surface);
+    overflow: hidden;
+  }
+  .folder-header {
+    padding: 10px 16px;
+    background: var(--bg-element);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+  }
+  .folder-item {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .folder-item:last-child {
+    border-bottom: none;
+  }
+  .folder-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .folder-name {
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+  .folder-path {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+  .folder-meta {
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-align: right;
+  }
+
+  /* Options Checkbox */
+  .options-bar {
+    margin-top: 16px;
+    display: flex;
+    gap: 24px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .checkbox-label input {
+    accent-color: var(--accent);
+  }
+
+  /* Button */
+  .actions {
+    margin-top: 24px;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .btn {
+    background: var(--primary);
+    color: #000;
+    border: none;
+    padding: 10px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn:hover {
+    opacity: 0.9;
+  }
+  .btn-secondary {
+    background: var(--bg-element);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover {
+    background: var(--bg-element-hover);
+  }
+
+  /* Active Running View */
+  .progress-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+  }
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 12px;
+  }
+  .progress-title {
+    font-weight: 500;
+    font-size: 15px;
+    color: var(--text-primary);
+  }
+  .progress-stats {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    background: var(--bg-element);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 65%;
+  }
+  .progress-details {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+  .detail-item strong {
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+
+  /* Completion View */
+  .completion-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 32px 24px;
+  }
+  .completion-header {
+    margin-bottom: 24px;
+  }
+  .completion-title {
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+  }
+  .completion-subtitle {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .summary-box {
+    background: var(--bg-element);
+    border: 1px solid var(--border);
+    padding: 14px;
+    border-radius: 6px;
+  }
+  .summary-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+  .summary-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="app-title">Manga-trans <span>Pipeline</span></div>
+  <div class="server-status">
+    <div class="status-indicator">
+      <span class="indicator-dot"></span>
+      ComfyUI
+    </div>
+    <div class="status-indicator">
+      <span class="indicator-dot"></span>
+      OpenRouter API
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="mockup-bar">
+    <button class="mockup-tab active" onclick="showTab('input')">1. 작업 등록</button>
+    <button class="mockup-tab" onclick="showTab('running')">2. 번역 진행 중</button>
+    <button class="mockup-tab" onclick="showTab('completed')">3. 작업 완료</button>
+  </div>
+
+  <!-- Tab 1: Input -->
+  <div id="tab-input" class="view-panel active">
+    <div class="drop-zone" onclick="alert('폴더 선택 창이 열립니다.')">
+      <div class="drop-title">번역할 만화 폴더를 여기에 끌어다 놓으세요</div>
+      <div class="drop-subtitle">여러 폴더를 동시에 선택하여 순차적으로 처리할 수 있습니다</div>
+    </div>
+
+    <div class="folder-list">
+      <div class="folder-header">
+        <span>등록된 폴더 목록 (2개)</span>
+        <span>총 380 페이지</span>
+      </div>
+      <div class="folder-item">
+        <div class="folder-info">
+          <span class="folder-name">Vol_01_chapter_01</span>
+          <span class="folder-path">/dev/Manga-trans/input/Vol_01_chapter_01</span>
+        </div>
+        <div class="folder-meta">200 pages</div>
+      </div>
+      <div class="folder-item">
+        <div class="folder-info">
+          <span class="folder-name">Vol_01_chapter_02</span>
+          <span class="folder-path">/dev/Manga-trans/input/Vol_01_chapter_02</span>
+        </div>
+        <div class="folder-meta">180 pages</div>
+      </div>
+    </div>
+
+    <div class="options-bar">
+      <label class="checkbox-label">
+        <input type="checkbox" checked>
+        기존 번역 완료된 파일 건너뛰기 (--skip-existing)
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" checked>
+        오류 발생 시 중단하지 않고 해당 페이지 스킵
+      </label>
+    </div>
+
+    <div class="actions">
+      <button class="btn" onclick="showTab('running')">번역 시작</button>
+    </div>
+  </div>
+
+  <!-- Tab 2: Running -->
+  <div id="tab-running" class="view-panel">
+    <div class="progress-card">
+      <div class="progress-header">
+        <div class="progress-title">Vol_01_chapter_01 번역 중...</div>
+        <div class="progress-stats">130 / 200 페이지 (65%)</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill"></div>
+      </div>
+      <div class="progress-details">
+        <div class="detail-item">남은 페이지: <strong>250 pages</strong> (전체 2개 폴더)</div>
+        <div class="detail-item">처리 속도: <strong>1.4 pages/min</strong></div>
+        <div class="detail-item">예상 남은 시간: <strong>약 3시간 10분</strong></div>
+      </div>
+    </div>
+
+    <div class="folder-list" style="margin-top: 16px;">
+      <div class="folder-header">
+        <span>대기열 현황</span>
+      </div>
+      <div class="folder-item">
+        <div class="folder-info">
+          <span class="folder-name" style="color: var(--accent);">▶ Vol_01_chapter_01</span>
+        </div>
+        <div class="folder-meta">진행 중 (130/200)</div>
+      </div>
+      <div class="folder-item">
+        <div class="folder-info">
+          <span class="folder-name" style="color: var(--text-tertiary);">Vol_01_chapter_02</span>
+        </div>
+        <div class="folder-meta" style="color: var(--text-tertiary);">대기 중 (0/180)</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-secondary">작업 일시정지</button>
+    </div>
+  </div>
+
+  <!-- Tab 3: Completed -->
+  <div id="tab-completed" class="view-panel">
+    <div class="completion-card">
+      <div class="completion-header">
+        <div class="completion-title">모든 폴더 번역 작업이 완료되었습니다.</div>
+        <div class="completion-subtitle">총 2개 폴더 (380 페이지) 처리 완료</div>
+      </div>
+
+      <div class="summary-grid">
+        <div class="summary-box">
+          <div class="summary-label">성공 완료</div>
+          <div class="summary-value">378 pages</div>
+        </div>
+        <div class="summary-box">
+          <div class="summary-label">캐시 적중 (스킵)</div>
+          <div class="summary-value">24 pages</div>
+        </div>
+        <div class="summary-box">
+          <div class="summary-label">오류 스킵</div>
+          <div class="summary-value">2 pages</div>
+        </div>
+      </div>
+
+      <div class="folder-list" style="margin-top: 0; margin-bottom: 24px;">
+        <div class="folder-item">
+          <div class="folder-info">
+            <span class="folder-name">Vol_01_chapter_01</span>
+            <span class="folder-path">/dev/Manga-trans/output/Vol_01_chapter_01</span>
+          </div>
+          <div class="folder-meta" style="color: var(--success);">완료</div>
+        </div>
+        <div class="folder-item">
+          <div class="folder-info">
+            <span class="folder-name">Vol_01_chapter_02</span>
+            <span class="folder-path">/dev/Manga-trans/output/Vol_01_chapter_02</span>
+          </div>
+          <div class="folder-meta" style="color: var(--success);">완료</div>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-top: 0; justify-content: space-between;">
+        <button class="btn btn-secondary" style="color: var(--error); border-color: transparent;">오류 스킵된 2개 페이지 재시도</button>
+        <button class="btn" onclick="alert('출력 폴더가 Finder에서 열립니다.')">출력 폴더 열기</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  function showTab(tabId) {
+    document.querySelectorAll('.mockup-tab').forEach((btn, idx) => {
+      const tabs = ['input', 'running', 'completed'];
+      btn.classList.toggle('active', tabs[idx] === tabId);
+    });
+    document.querySelectorAll('.view-panel').forEach(panel => {
+      panel.classList.remove('active');
+    });
+    document.getElementById('tab-' + tabId).classList.add('active');
+  }
+</script>
+</body>
+</html>

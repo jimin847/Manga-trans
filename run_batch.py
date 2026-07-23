@@ -53,20 +53,21 @@ def format_eta(seconds: float) -> str:
 RESUME_FILE = ".batch_progress.json"
 
 
-def load_progress() -> dict:
+def load_progress(path: str = RESUME_FILE) -> dict:
     """저장된 진행 상태 불러오기"""
-    if os.path.exists(RESUME_FILE):
+    if os.path.exists(path):
         try:
-            with open(RESUME_FILE, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
-            logger.warning(f"Corrupted progress file ({RESUME_FILE}), starting fresh.")
+            logger.warning(f"Corrupted progress file ({path}), starting fresh.")
     return {"completed": [], "failed": [], "partial": [], "results": [], "context": []}
 
 
-def save_progress(progress: dict):
+def save_progress(progress: dict, path: str = RESUME_FILE):
     """진행 상태 저장"""
-    with open(RESUME_FILE, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(progress, f, indent=2, ensure_ascii=False)
 
 
@@ -98,7 +99,7 @@ def main():
 
     api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
-        env_path = os.path.expanduser("~/.hermes/skills/manga-localization/.env")
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:
@@ -110,8 +111,12 @@ def main():
 
     # ── Resume / skip-existing ───────────────────────────────────────────
 
-    progress = load_progress() if args.resume else {}
     out_dir = Path(config["output"]["base_dir"])
+    resume_file = str(out_dir / ".batch_progress.json")
+    if args.report == "batch_report.json":
+        args.report = str(out_dir / "batch_report.json")
+
+    progress = load_progress(resume_file) if args.resume else {}
 
     filtered = []
     skipped_reason = {}
@@ -183,7 +188,7 @@ def main():
             progress["completed"] = list(set(progress.get("completed", []) + [page_id]))
             progress["results"] = results
             progress["context"] = list(global_context)
-            save_progress(progress)
+            save_progress(progress, resume_file)
 
         except Exception as e:
             page_time = time.time() - t0
@@ -197,7 +202,7 @@ def main():
             results.append(result)
             progress["failed"] = list(set(progress.get("failed", []) + [page_id]))
             progress["results"] = results
-            save_progress(progress)
+            save_progress(progress, resume_file)
 
     # ── Summary ──────────────────────────────────────────────────────────
 
@@ -248,9 +253,9 @@ def main():
     logger.info(f"  Batch report: {report_path}")
 
     # Clean up progress file on successful completion
-    if os.path.exists(RESUME_FILE) and success == total_count:
+    if os.path.exists(resume_file) and success == total_count:
         try:
-            os.remove(RESUME_FILE)
+            os.remove(resume_file)
             logger.info(f"  Progress file cleaned up (all {total_count} succeeded)")
         except OSError:
             pass

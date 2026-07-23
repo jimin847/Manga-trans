@@ -2,13 +2,20 @@
 comfy_client 단위 테스트
 """
 import json
+import sys
 import time
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 from PIL import Image
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from comfy_client import ComfyClient, flat_fill
 
@@ -232,7 +239,7 @@ class TestComfyClient:
 
         assert mock_upload.call_count == 2
         mock_queue.assert_called_once()
-        mock_wait.assert_called_once_with("prompt-42")
+        mock_wait.assert_called_once_with("prompt-42", timeout=180)
         mock_dl.assert_called_once()
 
     @patch("comfy_client.ComfyClient._upload_image")

@@ -2,42 +2,72 @@
 # YOLO detection + VLM OCR separated pipeline
 
 comfyui:
-  base_url: "http://127.0.0.1:8188"
+  base_url: "http://127.0.0.1:8000"
+  timeout: 180
 
 models:
-  text_segmenter: "/Users/bagjimin/Documents/ComfyUI/models/ultralytics/segm/comic-text-segmenter.pt"
-  bubble_detector: "/Users/bagjimin/Documents/ComfyUI/models/ultralytics/bbox/comic-speech-bubble-detector.pt"
+  root: "${MODELS_ROOT:-}"  # optional; 상대경로 기준 디렉토리. 비어있으면 기본 검색경로 사용
+  text_segmenter: "models/manga-text-segmenter-yolov26s.pt"
+  bubble_detector: "models/manga109-speech-bubble-yolo11n.pt"
 
 yolo:
-  conf_threshold: 0.25
-  iou_threshold: 0.45
+  conf_threshold: 0.20
+  iou_threshold: 0.55
   device: "mps"  # m1 GPU
 
 ocr:
   provider: "openrouter"
-  model: "qwen/qwen3-vl-8b-instruct"
+  model: "google/gemma-4-31b-it:free"
+  fallback_model: "google/gemma-4-31b-it:free"
   crop_upscale: 2
+  text_mask_margin: 8
   max_workers: 4
 
 translation:
   provider: "openrouter"
-  # google/gemini-2.5-flash → 일일 할당량 소진 시 OpenRouter 무료 모델로 fallback
   model: "openai/gpt-oss-120b:free"
+  fallback_model: "openai/gpt-oss-120b:free"
   target_lang: "ko"
+  preserve_terms: []
+  glossary: {}
+  translate_sfx: false
+
+typesetting:
+  target_font_size: 42
+  avg_char_width: 0.85
+  line_height: 52
+  padding: 20
+  bubble_padding: 10
+  skip_sfx: true
+  line_planning_scale: 0.65
+  max_chars_per_line: 6
 
 inpainting:
+  backend: "lama_onnx"  # Options: "lama_onnx", "opencv", "genai_edit", "comfyui", "local_diffusers"
+  model_path: "models/lama.onnx"
+  genai_provider: "lama_onnx"  # Options: "lama_onnx", "local_diffusers", "openrouter"
+
+
+
+  genai_prompt_erase: "Erase the Japanese text from this manga crop completely and reconstruct the underlying drawing style, lines, and screentones seamlessly without any smudging."
+  genai_prompt_replace: "Replace the Japanese text inside this manga crop with the following Korean translation: '{target_text}'. Maintain the exact illustration style, background artwork, and dynamic manga typography aesthetics."
   flat_fill: true  # 흰 말풍선은 flat fill (fast)
   lama_fallback: true  # 톤 말풍선은 LaMa 인페인팅
-  min_bubble_size: 500  # px², 이보다 작은 말풍선 무시
+  opencv_fallback: true
+  opencv_radius: 2
+  opencv_dilate: 1
+  preserve_bubble_shape: true
+  preserve_bubble_shape_text_bbox_dilate: 2
+  threshold_text_mask: true
+  threshold_left_margin_vertical: true
+  text_threshold_value: 185
+  text_threshold_left_margin_value: 160
+  text_threshold_left_margin_ratio: 0.25
+  text_threshold_min_component: 2
+  text_threshold_max_component: 900
+  text_threshold_dilate: 1
+  threshold_global_mask: false
 
 output:
-  base_dir: "/Users/bagjimin/dev/Manga-trans/output"
-  debug_overlay: false
-  save_crops: false
-  save_masks: false
-
-qa:
-  enabled: false  # 파이프라인 내 자동 QA 검증 (true 시 각 페이지 완료 후 검증)
-  report_dir: ""  # 비우면 output.base_dir 사용
-  warn_threshold: 40  # 번역覆盖率(%) 미만 시 warn
-  bad_threshold: 10   # 번역覆盖率(%) 미만 시 bad
+  debug_overlay: true
+  base_dir: "output"

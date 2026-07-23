@@ -53,46 +53,18 @@ class YoloDetector:
         self.iou = iou_threshold
         self.device = device
 
+        # 다중 클래스 모델(예: frame, text, balloon) 사용 시 text 클래스만 추출
+        self.text_classes = None
+        if hasattr(self.text_model, "names") and isinstance(self.text_model.names, dict):
+            if len(self.text_model.names) > 1:
+                t_cls = [k for k, v in self.text_model.names.items() if "text" in str(v).lower()]
+                if t_cls:
+                    self.text_classes = t_cls
+
     def detect(self, image: Image.Image, page_id: str = "000") -> DetectionResult:
         w, h = image.size
 
-        # --- 1. 텍스트 세그멘테이션 ---
-        text_results = self.text_model(
-            image,
-            conf=self.conf,
-            iou=self.iou,
-            device=self.device,
-            retina_masks=True,
-        )
-        tr = text_results[0]
-
-        # 전체 페이지 텍스트 마스크 누적
-        text_mask = None
-        texts = []
-        if tr.masks is not None:
-            masks = tr.masks.data.cpu().numpy()  # (N, orig_h, orig_w)
-            boxes = tr.boxes.xyxy.cpu().numpy() if tr.boxes is not None else None
-            confs = tr.boxes.conf.cpu().numpy() if tr.boxes is not None else None
-
-            # 마스크를 원본 해상도로 리사이즈
-            mask_accum = np.zeros((h, w), dtype=np.uint8)
-            for i, mask in enumerate(masks):
-                # mask shape: (model_h, model_w) — bilinear resize to (h, w)
-                mask_img = Image.fromarray((mask * 255).astype(np.uint8))
-                mask_resized = np.array(mask_img.resize((w, h), Image.BILINEAR))
-                mask_accum = np.maximum(mask_accum, mask_resized)
-
-                bbox = [float(x) for x in boxes[i]] if boxes is not None else None
-                conf = float(confs[i]) if confs is not None else 0.0
-                texts.append({
-                    "id": f"t{i+1:03d}",
-                    "bbox": bbox,
-                    "confidence": conf,
-                })
-
-            text_mask = mask_accum
-
-        # --- 2. 말풍선 검출 ---
+        # --- 1. 말풍선 검출 ---
         bubble_results = self.bubble_model(
             image,
             conf=self.conf,
@@ -113,11 +85,79 @@ class YoloDetector:
                 if (x2 - x1) * (y2 - y1) < 500:
                     continue
                 bubbles.append({
-                    "id": f"b{i+1:03d}",
+                    "id": f"b{len(bubbles)+1:03d}",
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
                     "confidence": float(confs[i]),
                     "type": "bubble",
                 })
+
+        # --- 2. 텍스트 영역 감지 및 분류 ---
+        text_kwargs = {
+            "conf": self.conf,
+            "iou": self.iou,
+            "device": self.device,
+            "retina_masks": True,
+        }
+        if self.text_classes is not None:
+            text_kwargs["classes"] = self.text_classes
+
+        text_results = self.text_model(image, **text_kwargs)
+        tr = text_results[0]
+
+        bubble_mask_accum = np.zeros((h, w), dtype=np.uint8)
+        floating_mask_accum = np.zeros((h, w), dtype=np.uint8)
+        all_mask_accum = np.zeros((h, w), dtype=np.uint8)
+        texts = []
+        floating_texts = []
+
+        if tr.masks is not None:
+            masks = tr.masks.data.cpu().numpy()  # (N, orig_h, orig_w)
+            boxes = tr.boxes.xyxy.cpu().numpy() if tr.boxes is not None else None
+            confs = tr.boxes.conf.cpu().numpy() if tr.boxes is not None else None
+
+            for i, mask in enumerate(masks):
+                mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+                mask_resized = np.array(mask_img.resize((w, h), Image.BILINEAR))
+                all_mask_accum = np.maximum(all_mask_accum, mask_resized)
+
+                bbox = [float(x) for x in boxes[i]] if boxes is not None else [0.0, 0.0, float(w), float(h)]
+                conf = float(confs[i]) if confs is not None else 0.0
+
+                tx1, ty1, tx2, ty2 = bbox
+                tarea = max(1.0, (tx2 - tx1) * (ty2 - ty1))
+
+                # Check intersection with detected bubbles
+                in_bubble = False
+                for b in bubbles:
+                    bx1, by1, bx2, by2 = b["bbox"]
+                    ix1 = max(tx1, bx1)
+                    iy1 = max(ty1, by1)
+                    ix2 = min(tx2, bx2)
+                    iy2 = min(ty2, by2)
+                    if ix2 > ix1 and iy2 > iy1:
+                        iarea = (ix2 - ix1) * (iy2 - iy1)
+                        if iarea / tarea >= 0.35:
+                            in_bubble = True
+                            break
+
+                texts.append({
+                    "id": f"t{i+1:03d}",
+                    "bbox": bbox,
+                    "confidence": conf,
+                    "in_bubble": in_bubble,
+                })
+
+                if in_bubble:
+                    bubble_mask_accum = np.maximum(bubble_mask_accum, mask_resized)
+                else:
+                    floating_mask_accum = np.maximum(floating_mask_accum, mask_resized)
+                    if tarea >= 400:
+                        floating_texts.append({
+                            "id": f"f{len(floating_texts)+1:03d}",
+                            "bbox": bbox,
+                            "confidence": conf,
+                            "type": "floating_text",
+                        })
 
         result: DetectionResult = {
             "page_id": page_id,
@@ -125,7 +165,10 @@ class YoloDetector:
             "height": h,
             "bubbles": bubbles,
             "texts": texts,
-            "text_mask": text_mask,
+            "floating_texts": floating_texts,
+            "text_mask": bubble_mask_accum if tr.masks is not None else None,
+            "floating_text_mask": floating_mask_accum if tr.masks is not None else None,
+            "all_text_mask": all_mask_accum if tr.masks is not None else None,
         }
         return result
 

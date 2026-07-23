@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("typeset")
@@ -96,7 +97,7 @@ def scale_vlm_bboxes(plans, img_w, img_h):
         # Y stays as-is
 
 
-def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict) -> int:
+def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict, preferred_font_size: Optional[int] = None) -> int:
     """
     Iterative font-size calculator that finds the largest size where
     word-wrapped text fits within bbox dimensions.
@@ -108,7 +109,11 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict) -> in
     base = preset.get("base_font_size", 48)
     min_fs = preset.get("min_font_size", 28)
     max_fs = preset.get("max_font_size", 72)
+    preferred = preferred_font_size if preferred_font_size else None
+    if preferred is not None:
+        max_fs = max(min_fs, min(max_fs, int(preferred)))
     padding = preset.get("padding", 10)
+    stroke_width = preset.get("stroke_width", 5)
 
     if not text or len(text) == 0:
         return base
@@ -116,8 +121,11 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict) -> in
     # Ensure QApplication exists
     app = QApplication.instance() or QApplication(["hermes_typeset"])
 
-    usable_w = bbox_w - padding * 2
-    usable_h = bbox_h - padding * 2
+    text_img_w = bbox_w - padding * 2
+    text_img_h = bbox_h - padding * 2
+    margin = stroke_width + padding
+    usable_w = text_img_w - margin * 2
+    usable_h = text_img_h - margin * 2
 
     if usable_w <= 0 or usable_h <= 0:
         return min_fs
@@ -135,35 +143,26 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict) -> in
         fm = QFontMetrics(font)
 
         # Simulate word-wrap: count lines needed
-        line_h = fm.height()
+        line_h = fm.lineSpacing()
         words = text.replace("\n", " \n ").split()
 
         total_lines = 0
+        current_w = 0.0
         for word in words:
             if word == "\n":
                 total_lines += 1
+                current_w = 0.0
                 continue
-            # Current line accumulation
+            word_w = fm.horizontalAdvance(word)
             if total_lines == 0:
                 total_lines = 1
-            # Measure word width
-            word_w = fm.horizontalAdvance(word)
-            # Rough estimate: fit as many words as possible per line
-            # (simplified — actual wrapping is more nuanced)
-            # Use chars-based estimate instead
-            pass
-
-        # Simpler: estimate lines by total text width divided by usable width
-        total_text_w = fm.horizontalAdvance(text.replace("\n", ""))
-        # Add \n as forced line breaks
-        forced_breaks = text.count("\n")
-        # Average chars that fit per line at this font size
-        avg_char_w = fm.horizontalAdvance("가나다라마바사아자차") / 10  # 10 Korean chars
-        chars_per_line = max(1.0, usable_w / avg_char_w)
-        # Total chars (excluding \n)
-        total_chars = len(text.replace("\n", ""))
-        wrapped_lines = max(1.0, total_chars / chars_per_line)
-        total_lines = forced_breaks + max(0, int(wrapped_lines))
+            if current_w and current_w + fm.horizontalAdvance(" ") + word_w > usable_w:
+                total_lines += 1
+                current_w = word_w
+            else:
+                current_w += word_w + (fm.horizontalAdvance(" ") if current_w else 0)
+        if current_w == 0 and total_lines == 0:
+            total_lines = 1
 
         needed_h = total_lines * line_h
 
@@ -208,6 +207,13 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
 
     font_family = "Apple SD Gothic Neo"
 
+    # Render lower bubbles first so overlapping detected bboxes don't cover text above them.
+    typeset_plans = sorted(
+        typeset_plans,
+        key=lambda p: (int((p.get("bbox") or [0])[1]), int((p.get("bbox") or [0])[0])),
+        reverse=True,
+    )
+
     for plan in typeset_plans:
         bbox = plan.get("bbox")
         if not bbox or len(bbox) < 4:
@@ -226,7 +232,7 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         preset = STYLE_PRESETS.get(style_name, STYLE_PRESETS["normal"])
 
         # Font size from iterative binary-search calculator
-        font_size = calculate_font_size(bbox_w, bbox_h, text, preset)
+        font_size = calculate_font_size(bbox_w, bbox_h, text, preset, plan.get("estimated_font_size"))
 
         padding = preset.get("padding", 10)
         stroke_width = preset.get("stroke_width", 5)
@@ -235,9 +241,11 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         font.setWeight(QFont.Bold if preset.get("font_weight") == "Bold" else QFont.Normal)
         font.setStyleHint(QFont.SansSerif)
 
-        # Temp image: bbox-sized text area so word-wrap triggers naturally
-        text_img_w = bbox_w - padding * 2
-        text_img_h = bbox_h - padding * 2
+        # Temp image: intentionally taller than bbox so QPainter never clips long text.
+        # After rendering we tight-crop and scale the actual glyph bounds down if needed.
+        margin = stroke_width + padding
+        text_img_w = bbox_w
+        text_img_h = max(bbox_h, int(font_size * 20) + margin * 4)
 
         text_img = QImage(text_img_w, text_img_h, QImage.Format_ARGB32)
         text_img.fill(Qt.transparent)
@@ -247,7 +255,6 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         tp.setRenderHint(QPainter.TextAntialiasing)
         tp.setFont(font)
 
-        margin = stroke_width + padding
         # The text rect should be WIDE enough that text doesn't wrap unnecessarily,
         # but we'll measure actual bounds after rendering
         text_rect = QRectF(margin, margin,
@@ -262,18 +269,21 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         # Fill
         fill_color = QColor(preset.get("color", "#000000"))
 
-        # Configure drawText for auto word-wrap + center alignment
-        option = QTextOption()
-        option.setAlignment(Qt.AlignHCenter)
-        option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        if plan.get("vertical", False):
+            _render_vertical_text(tp, text_rect, text, font, stroke_pen, fill_color)
+        else:
+            # Configure drawText for auto word-wrap + center alignment
+            option = QTextOption()
+            option.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            option.setWrapMode(QTextOption.WrapMode.NoWrap)
 
-        # Stroke pass
-        tp.setPen(stroke_pen)
-        tp.drawText(text_rect, text, option)
+            # Stroke pass
+            tp.setPen(stroke_pen)
+            tp.drawText(text_rect, text, option)
 
-        # Fill pass
-        tp.setPen(fill_color)
-        tp.drawText(text_rect, text, option)
+            # Fill pass
+            tp.setPen(fill_color)
+            tp.drawText(text_rect, text, option)
 
         tp.end()
 
@@ -305,6 +315,28 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
     main_qimage.save(output_png_path)
     logger.info(f"Typesetting complete -> {output_png_path}")
     return True
+
+
+def _render_vertical_text(painter, rect, text, font, stroke_pen, fill_color):
+    from PyQt5.QtCore import Qt
+    painter.setFont(font)
+    columns = [col for col in text.split("\n") if col.strip()] or [text]
+    fm = painter.fontMetrics()
+    char_step = max(1, int(fm.height() * 0.9))
+    col_gap = max(1, int(fm.horizontalAdvance(" ") * 1.2))
+    max_col_len = max(len(col) for col in columns)
+    total_w = len(columns) * char_step + max(0, len(columns) - 1) * col_gap
+    start_x = int(rect.right()) - max(0, int((rect.width() - total_w) / 2))
+    start_y = int(rect.top()) + max(0, int((rect.height() - (max_col_len - 1) * fm.height() * 0.9) / 2))
+    for col_i, col in enumerate(columns):
+        x = start_x - col_i * (char_step + col_gap)
+        for j, ch in enumerate(col):
+            y = start_y + int(j * fm.height() * 0.9)
+            char_rect = rect.__class__(x - char_step // 2, y - fm.height() // 2, char_step, fm.height())
+            painter.setPen(stroke_pen)
+            painter.drawText(char_rect, Qt.AlignmentFlag.AlignCenter, ch)
+            painter.setPen(fill_color)
+            painter.drawText(char_rect, Qt.AlignmentFlag.AlignCenter, ch)
 
 
 def _crop_transparent(image, margin=0):

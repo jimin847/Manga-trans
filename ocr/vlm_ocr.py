@@ -18,6 +18,7 @@ OCR_SYSTEM_PROMPT = """You are a Japanese manga OCR scanner. You have NO transla
 - NEVER translate to Korean, English, or any other language
 - NEVER add explanations, notes, or commentary
 - Preserve kanji, hiragana, katakana, numbers, and punctuation exactly as shown
+- For katakana words, copy katakana exactly. Do NOT replace them with Korean, English, or similar-looking characters
 - For vertical text: read top-to-bottom, right-to-left
 - For horizontal text: read left-to-right, top-to-bottom
 - Include sound effects (SFX) if any
@@ -27,13 +28,26 @@ OCR_SYSTEM_PROMPT = """You are a Japanese manga OCR scanner. You have NO transla
 
 
 class VlmOcr:
-    def __init__(self, provider: str = "openrouter", model: str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-                 fallback_model: Optional[str] = None):
+    def __init__(
+        self,
+        provider: str = "openrouter",
+        model: str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        fallback_model: Optional[str] = None,
+    ):
         self.provider = provider
         self.model = model
         self.fallback_model = fallback_model
         self.api_base = "https://openrouter.ai/api/v1"
         self._thread_local = threading.local()
+        self._api_lock = threading.Lock()
+        self.auth_failed = False
+
+    @staticmethod
+    def _is_auth_error(resp) -> bool:
+        body = getattr(resp, "text", "").lower()
+        return resp.status_code in (401, 403) or (
+            resp.status_code == 400 and ("user not found" in body or "unauthorized" in body)
+        )
 
     def _get_session(self):
         import requests
@@ -44,12 +58,35 @@ class VlmOcr:
             self._thread_local.session = session
         return session
 
+    def check_auth(self, api_key: str) -> bool:
+        """Return False for OpenRouter auth/key failures so OCR can skip the page."""
+        if self.auth_failed or self.provider == "google-ai-studio":
+            return not self.auth_failed
+
+        session = self._get_session()
+        try:
+            resp = session.get(
+                f"{self.api_base}/auth/key",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"OCR auth check failed to reach OpenRouter, continuing to OCR: {e}")
+            return True
+
+        if self._is_auth_error(resp):
+            logger.error(f"OCR API auth check failed: {resp.status_code} {resp.text[:300]}")
+            self.auth_failed = True
+            self._thread_local.auth_failed = True
+            return False
+        return True
+
     def _call_api(self, crop: Image.Image, api_key: str, model: str, timeout: int = 30, orientation: Optional[str] = None) -> Optional[str]:
         buf = BytesIO()
         crop.save(buf, format="JPEG", quality=95)
         b64 = base64.b64encode(buf.getvalue()).decode()
 
-        user_text = "Transcribe the EXACT characters in this image character-by-character in Japanese. Do NOT translate. If the text says '15万' in the image, write '15万' — not Korean, not English, not any other language. Output the raw Japanese text exactly as written."
+        user_text = "Transcribe the EXACT characters in this image character-by-character in Japanese. Do NOT translate. If the text says '15万' in the image, write '15万' — not Korean, not English, not any other language. For katakana words, preserve katakana exactly. Output the raw Japanese text exactly as written."
         if orientation == "vertical":
             user_text += " Hint: vertical text — read top-to-bottom, right-to-left."
         elif orientation == "horizontal":
@@ -80,18 +117,27 @@ class VlmOcr:
         max_retries = 6
         for attempt in range(1, max_retries + 1):
             try:
-                resp = session.post(
-                    f"{self.api_base}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=timeout,
-                )
+                with self._api_lock:
+                    if self.auth_failed:
+                        return None
+                    resp = session.post(
+                        f"{self.api_base}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                        timeout=timeout,
+                    )
 
                 if resp.status_code == 200:
                     break  # success
+
+                if self._is_auth_error(resp):
+                    logger.error(f"OCR API auth error ({model}): {resp.status_code} {resp.text[:300]}")
+                    self.auth_failed = True
+                    self._thread_local.auth_failed = True
+                    return None
 
                 logger.error(f"OCR API error ({model}) {resp.status_code} (attempt {attempt}/{max_retries})")
                 try:
@@ -137,7 +183,7 @@ class VlmOcr:
         google_key = os.environ.get("GOOGLE_API_KEY", "")
         if not google_key:
             # Try the skill-level .env
-            env_path = os.path.expanduser("~/.hermes/skills/manga-localization/.env")
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
             if os.path.exists(env_path):
                 with open(env_path) as f:
                     for line in f:
@@ -183,15 +229,24 @@ RULES:
         max_retries = 6
         for attempt in range(1, max_retries + 1):
             try:
-                resp = session.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={google_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=timeout,
-                )
+                with self._api_lock:
+                    if self.auth_failed:
+                        return None
+                    resp = session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={google_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=timeout,
+                    )
 
                 if resp.status_code == 200:
                     break  # success
+
+                if self._is_auth_error(resp):
+                    logger.error(f"Google OCR API auth error ({model}): {resp.status_code} {resp.text[:300]}")
+                    self.auth_failed = True
+                    self._thread_local.auth_failed = True
+                    return None
 
                 logger.error(f"Google OCR API error ({model}) {resp.status_code} (attempt {attempt}/{max_retries})")
                 body = resp.text[:500]
@@ -231,6 +286,18 @@ RULES:
             return None
 
     @staticmethod
+    def _is_placeholder_text(text: str) -> bool:
+        import re
+        compact = re.sub(r"\s+", "", text)
+        if not compact:
+            return False
+        placeholder_chars = set("〇○◯●・。、,.!?！？…◇◆□■▢△▲▽▼○●")
+        kana_kanji = re.search(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]", compact)
+        if kana_kanji and any(ch not in placeholder_chars and not ch.isdigit() and ch not in "第話歳年ヶ月日" for ch in compact):
+            return False
+        return all(ch in placeholder_chars or ch.isdigit() or ch in "第話歳年ヶ月日" for ch in compact)
+
+    @staticmethod
     def _clean(text: str) -> str:
         import re
         # Strip thinking and translation tags
@@ -240,6 +307,7 @@ RULES:
         
         # Noise reduction: cap repeating punctuation to max 3 (e.g. ....... -> ...)
         text = re.sub(r'([.、。・…!?,~～/|]){4,}', r'\1\1\1', text)
+        text = re.sub(r"[〇○◯●◇◆□■▢△▲▽▼]{2,}", " ", text)
         
         # If line contains only symbols/punctuation, it's likely background noise
         lines = text.split("\n")
@@ -267,12 +335,19 @@ RULES:
                 cleaned_lines.append(line)
                 
         cleaned_text = "\n".join(cleaned_lines).strip()
+        if VlmOcr._is_placeholder_text(cleaned_text):
+            return ""
         return cleaned_text
 
     def read_crop(self, crop: Image.Image, api_key: str, orientation: Optional[str] = None) -> Optional[str]:
         """Read text from a bubble crop image. Retry once if reasoning leak detected. Fallback if failed."""
+        if self.auth_failed:
+            return None
+        self._thread_local.auth_failed = False
         if self.provider == "google-ai-studio":
             text = self._call_google_api(crop, api_key, self.model, timeout=30, orientation=orientation)
+            if self.auth_failed or getattr(self._thread_local, "auth_failed", False):
+                return None
 
             if not text and self.fallback_model:
                 logger.warning(f"  Primary OCR failed. Retrying with fallback: {self.fallback_model}")
@@ -282,6 +357,8 @@ RULES:
 
         # OpenRouter provider (default)
         text = self._call_api(crop, api_key, self.model, timeout=30, orientation=orientation)
+        if self.auth_failed or getattr(self._thread_local, "auth_failed", False):
+            return None
 
         # Fallback if primary model completely failed
         if not text and self.fallback_model:

@@ -18,7 +18,7 @@ Task: Translate JSON-array of Japanese manga text into natural Korean. Classify 
 Input format:
 [{"id": "b001", "text": "日本語"}, {"id": "b002", "text": "ドカーン"}]
 
-Output format MUST be a valid JSON array:
+Output format MUST be a valid JSON array and NOTHING else:
 [{"id": "b001", "translation": "한국어", "type": "dialogue"}, {"id": "b002", "translation": "쾅", "type": "sfx"}]
 
 Type Classification:
@@ -30,7 +30,11 @@ CRITICAL RULES — follow exactly:
 
 1. TRANSLATE ALL JAPANESE into Korean. Every word, every particle. No Japanese characters in output.
 
-2. CHARACTER NAMES: Convert to Korean alphabet (hangul). みゆき→미유키, 御幸→미유키, 田中→타나카, 太郎→타로, 碧→미도리/헤키 (pick the most common reading). Keep the name but write it in hangul. If a name has mixed kana+kanji, convert all to hangul.
+2. CHARACTER NAMES: Preserve character/person names exactly as they appear in the Japanese source unless an explicit glossary mapping is provided. Do NOT transliterate names to Hangul and do NOT translate names into Korean.
+   - みゆき stays みゆき
+   - 御幸 stays 御幸
+   - 田中 stays 田中
+   If a glossary mapping exists, use that exact translation for the mapped term only.
 
 3. KOREAN SPACING: Every word boundary needs a space.
    WRONG: "미유키가만들었대" → RIGHT: "미유키가 만들었대"
@@ -39,21 +43,68 @@ CRITICAL RULES — follow exactly:
 
 5. Sound effects: translate to natural Korean onomatopoeia. Never leave SFX in Japanese.
 
-6. First char must be `[`, last must be `]`. No markdown, no explanations.
+6. First char must be `[`, last must be `]`. No markdown, no explanations, no reasoning, no line-by-line analysis.
 
-7. Preserve line breaks (\n) in output."""
+7. Preserve line breaks (\n) in output.
+
+8. If uncertain, translate literally. Do NOT ask questions and do NOT output notes.
+
+9. NEVER leave Japanese characters in translation. This includes Hiragana, Katakana, and Japanese Kanji.
+   - Translate Japanese titles/honorifics: 旦那様→남편님, 様→님, さん/氏→씨, ちゃん→쨩, 先輩→선배, 先生→선생님.
+   - Translate common literal traps naturally: 一生→평생, 最早→이제는, 不束者ですが→서툴지만/서툰 사람인데, 一片の憂い無し→한 점의 근심도 없어, いっしょうまも/一生守る→평생 지켜줄게.
+
+10. Do NOT preserve Japanese names/titles unless they are explicit proper names or a glossary mapping is provided.
+"""
 
 class Translator:
-    def __init__(self, provider: str = "openrouter", model: str = "google/gemini-2.5-flash:free"):
+    def __init__(
+        self,
+        provider: str = "openrouter",
+        model: str = "openai/gpt-oss-120b:free",
+        glossary: Optional[dict[str, str]] = None,
+        preserve_terms: Optional[list[str]] = None,
+    ):
         self.provider = provider
         self.model = model
+        self.glossary = glossary or {}
+        self.preserve_terms = preserve_terms or []
         self.api_base = "https://openrouter.ai/api/v1"
         self._session = None
+        self.auth_failed = False
 
     def _get_session(self):
         if self._session is None:
             self._session = requests.Session()
         return self._session
+
+    def check_auth(self, api_key: str) -> bool:
+        """Return False for OpenRouter auth/key failures so translation can skip the page."""
+        if self.auth_failed:
+            return False
+
+        session = self._get_session()
+        try:
+            resp = session.get(
+                f"{self.api_base}/auth/key",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"Translation auth check failed to reach OpenRouter, continuing to translation: {e}")
+            return True
+
+        if self._is_auth_error(resp):
+            logger.error(f"Translation API auth check failed: {resp.status_code} {resp.text[:300]}")
+            self.auth_failed = True
+            return False
+        return True
+
+    @staticmethod
+    def _is_auth_error(resp) -> bool:
+        body = getattr(resp, "text", "").lower()
+        return resp.status_code in (401, 403) or (
+            resp.status_code == 400 and ("user not found" in body or "unauthorized" in body)
+        )
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -86,8 +137,22 @@ class Translator:
         obj_match = re.search(r"\{[\s\S]*\}", text)
         if obj_match:
             return obj_match.group(0).strip()
-
         return text.strip()
+
+    def _build_system_prompt(self, extra_instruction: Optional[str] = None) -> str:
+        prompt = TRANSLATE_SYSTEM_PROMPT
+        rules = []
+        for source, target in self.glossary.items():
+            if isinstance(target, str) and target.strip():
+                rules.append(f"- Preserve/translate exact term {source!r} as {target!r}.")
+        for term in self.preserve_terms:
+            if isinstance(term, str) and term.strip():
+                rules.append(f"- Preserve exact source spelling for {term!r}; do not translate or transliterate it.")
+        if rules:
+            prompt += "\n\nGLOSSARY / PRESERVED TERMS:\n" + "\n".join(rules)
+        if extra_instruction:
+            prompt += "\n\nSTRICT EXTRA INSTRUCTION:\n" + extra_instruction
+        return prompt
 
     @staticmethod
     def _sanitize_translation_item(item: dict) -> dict:
@@ -108,13 +173,15 @@ class Translator:
     def _sanitize_batch_result(cls, items: list[dict]) -> list[dict]:
         return [cls._sanitize_translation_item(dict(item)) for item in items]
 
-    def translate_batch(self, texts: list[dict], api_key: str = "", previous_context: Optional[list[str]] = None) -> Optional[list[dict]]:
+    def translate_batch(self, texts: list[dict], api_key: str = "", previous_context: Optional[list[str]] = None, extra_instruction: Optional[str] = None) -> Optional[list[dict]]:
         """Translate a batch of texts formatted as [{"id": "...", "text": "..."}]"""
+        if self.auth_failed:
+            return None
         if not texts:
             return []
 
         user_msg = json.dumps(texts, ensure_ascii=False, indent=2)
-        system_prompt = TRANSLATE_SYSTEM_PROMPT
+        system_prompt = self._build_system_prompt(extra_instruction=extra_instruction)
         
         if previous_context and len(previous_context) > 0:
             context_str = "\n".join([f"- {c}" for c in previous_context])
@@ -128,7 +195,7 @@ class Translator:
             "messages": messages,
             "temperature": 0,
             "top_p": 1,
-            "max_tokens": 4096,
+            "max_tokens": 1500,
             "chat_template_kwargs": {"enable_thinking": False},
             "reasoning": {"exclude": True},
         }
@@ -180,7 +247,12 @@ class Translator:
                     data = resp.json()
                     return data["choices"][0]["message"]["content"].strip()
 
-                logger.error(f"Translation API error {resp.status_code} (attempt {attempt}/{max_retries})")
+                if self._is_auth_error(resp):
+                    logger.error(f"Translation API auth error ({self.model}): {resp.status_code} {resp.text[:300]}")
+                    self.auth_failed = True
+                    return None
+
+                logger.error(f"Translation API error ({self.model}) {resp.status_code} (attempt {attempt}/{max_retries})")
                 if attempt < max_retries and resp.status_code in (502, 503, 504, 429):
                     base_wait = 4 if resp.status_code == 429 else 2
                     wait = min(base_wait ** attempt, 60)
@@ -205,7 +277,7 @@ class Translator:
         # Resolve Google API key
         google_key = os.environ.get("GOOGLE_API_KEY", "")
         if not google_key:
-            env_path = os.path.expanduser("~/.hermes/skills/manga-localization/.env")
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
             if os.path.exists(env_path):
                 with open(env_path) as f:
                     for line in f:
@@ -259,7 +331,12 @@ class Translator:
                     logger.error(f"Google API: empty response — {json.dumps(data, ensure_ascii=False)[:500]}")
                     return None
 
-                logger.error(f"Google API error {resp.status_code} (attempt {attempt}/{max_retries}): {resp.text[:300]}")
+                if self._is_auth_error(resp):
+                    logger.error(f"Translation API auth error ({self.model}): {resp.status_code} {resp.text[:300]}")
+                    self.auth_failed = True
+                    return None
+
+                logger.error(f"Translation API error ({self.model}) {resp.status_code} (attempt {attempt}/{max_retries})")
                 if attempt < max_retries and resp.status_code in (429, 500, 502, 503, 504):
                     base_wait = 4 if resp.status_code == 429 else 2
                     wait = min(base_wait ** attempt, 60)

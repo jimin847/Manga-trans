@@ -57,8 +57,17 @@ WORKFLOW_LAMA = {
 
 
 class ComfyClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8188"):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000", timeout: int = 180):
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def check_available(self, timeout: int = 2) -> bool:
+        """Return True if ComfyUI responds quickly."""
+        try:
+            resp = requests.get(f"{self.base_url}/system_stats", timeout=timeout)
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
 
     def _upload_image(self, image_data: bytes, filename: str) -> str:
         """Upload image to ComfyUI."""
@@ -156,7 +165,7 @@ class ComfyClient:
 
             prompt_id = self._queue_prompt(workflow)
             logger.info(f"LaMa prompt queued: {prompt_id}")
-            history = self._wait_for_result(prompt_id)
+            history = self._wait_for_result(prompt_id, timeout=self.timeout)
             result = self._download_image(history)
             return result
         except Exception as e:
@@ -164,13 +173,34 @@ class ComfyClient:
             return None
 
 
+def opencv_inpaint(image: Image.Image, mask: Image.Image, radius: int = 3, dilate_iterations: int = 2) -> Image.Image:
+    """Small local fallback for remaining text masks when ComfyUI is unavailable."""
+    import cv2
+    import numpy as np
+
+    mask_l = mask.convert("L")
+    if mask_l.getbbox() is None:
+        return image.copy()
+
+    img = np.array(image.convert("RGB"))
+    mask_arr = np.array(mask_l)
+    if dilate_iterations > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        mask_arr = cv2.dilate(mask_arr, kernel, iterations=dilate_iterations)
+    if not np.any(mask_arr > 128):
+        return image.copy()
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    inpainted = cv2.inpaint(bgr, mask_arr, radius, cv2.INPAINT_TELEA)
+    return Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)).convert("RGB")
+
+
 def flat_fill(image: Image.Image, mask: Image.Image,
-              bubbles: Optional[list] = None) -> tuple[Image.Image, Optional[Image.Image]]:
+              bubbles: Optional[list] = None, texts: Optional[list] = None) -> tuple[Image.Image, Optional[Image.Image]]:
     """
     Smart flat fill.
-    When bubbles are provided: only fills white-background bubble regions;
-    returns remaining mask for tone/screentone bubbles.
-    When bubbles=None: old behavior, fills everything (backward compat).
+    When bubbles are provided: judges background brightness using inner text bounding boxes (if available)
+    or median brightness to avoid interference from dark speech bubble borders.
+    For white bubbles: fills text boxes and dilated text masks completely.
     """
     import numpy as np
     from scipy import ndimage
@@ -190,31 +220,59 @@ def flat_fill(image: Image.Image, mask: Image.Image,
 
             roi_mask = m[by1:by2, bx1:bx2]
 
-            # Sample non-masked interior → estimate background brightness
-            bg_pixels = img[by1:by2, bx1:bx2][roi_mask <= 128]
+            # 1. 배경 밝기 판별: 말풍선 안쪽에 위치한 파란색 글자 박스(texts) 안의 픽셀을 우선 샘플링
+            bg_pixels = []
+            matched_texts = []
+            if texts:
+                for t in texts:
+                    tx1, ty1, tx2, ty2 = [int(v) for v in t["bbox"]]
+                    ix1, iy1 = max(bx1, tx1), max(by1, ty1)
+                    ix2, iy2 = min(bx2, tx2), min(by2, ty2)
+                    if ix2 > ix1 and iy2 > iy1:
+                        matched_texts.append([tx1, ty1, tx2, ty2])
+                        t_mask = m[iy1:iy2, ix1:ix2]
+                        t_bg = img[iy1:iy2, ix1:ix2][t_mask <= 128]
+                        if len(t_bg) > 0:
+                            bg_pixels.extend(t_bg)
+
+            # 매칭된 글자 박스 픽셀이 부족하거나 없을 시, 기존 말풍선 박스 내 픽셀 사용
             if len(bg_pixels) < 10:
-                # Tiny region — remove from remaining (ignore)
+                bg_pixels = img[by1:by2, bx1:bx2][roi_mask <= 128]
+
+            if len(bg_pixels) < 10:
                 remaining[by1:by2, bx1:bx2][roi_mask > 128] = 0
                 continue
 
-            mean_brightness = np.mean(bg_pixels.astype(np.float32))
+            # 어두운 외곽선 노이즈 영향을 안 받는 중앙값(median)으로 배경 판별
+            median_brightness = np.median(bg_pixels)
 
-            if mean_brightness > 220:  # ← WHITE / near-white background
-                border = ndimage.binary_dilation(roi_mask > 128, iterations=5) & ~(roi_mask > 128)
-                fill_color = (255, 255, 255,)
+            if median_brightness > 210:  # ← WHITE / near-white background
+                fill_color = (255, 255, 255)
+                # 안티에일리싱(계단현상) 회색 픽셀 잔상을 완전히 제거하기 위해 여유롭게 확장된 마스크 클리닝
+                clean_mask = ndimage.binary_dilation(roi_mask > 20, iterations=4)
+                border = ndimage.binary_dilation(clean_mask, iterations=3) & ~clean_mask
                 if border.sum() > 5:
                     fill_color = tuple(np.median(img[by1:by2, bx1:bx2][border], axis=0).astype(int).tolist())
-                result[by1:by2, bx1:bx2][roi_mask > 128] = fill_color
-                remaining[by1:by2, bx1:bx2][roi_mask > 128] = 0
+                result[by1:by2, bx1:bx2][clean_mask] = fill_color
+                remaining[by1:by2, bx1:bx2][clean_mask] = 0
+
+                # 흰색 말풍선 내부의 파란 글자 박스를 안전하게 함께 클리닝 (글자 자국 100% 원천 봉쇄)
+                for tx1, ty1, tx2, ty2 in matched_texts:
+                    ix1, iy1 = max(bx1 + 2, tx1), max(by1 + 2, ty1)
+                    ix2, iy2 = min(bx2 - 2, tx2), min(by2 - 2, ty2)
+                    if ix2 > ix1 and iy2 > iy1:
+                        result[iy1:iy2, ix1:ix2] = fill_color
+                        remaining[iy1:iy2, ix1:ix2] = 0
             # tone → leave in remaining for LaMa
 
     else:
         # Legacy path: fill entire mask
-        border = ndimage.binary_dilation(m > 128, iterations=5) & ~(m > 128)
+        clean_mask = ndimage.binary_dilation(m > 20, iterations=4)
+        border = ndimage.binary_dilation(clean_mask, iterations=3) & ~clean_mask
         fill_color = (255, 255, 255)
         if border.sum() > 5:
             fill_color = tuple(np.median(img[border], axis=0).astype(int).tolist())
-        result[m > 128] = fill_color
+        result[clean_mask] = fill_color
         remaining = np.zeros_like(m)  # nothing left
 
     remaining_img = Image.fromarray(remaining) if np.any(remaining > 128) else None
