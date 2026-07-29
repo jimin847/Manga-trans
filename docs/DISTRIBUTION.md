@@ -37,12 +37,13 @@ pyinstaller --clean Manga-trans.spec
 
 ## 💡 배포 시 필수 안내 사항 (최종 사용자용 가이드)
 
-본 프로그램은 엔드투엔드 만화 번역 파이프라인으로, 앱 실행 후 실제 번역을 수행하려면 다음 외부 서비스 연동이 필요합니다.
+본 프로그램은 엔드투엔드 만화 번역 파이프라인으로, 기본 `config.yaml`에서는 다음 로컬 구성 요소가 필요합니다.
 
-1. **OpenRouter API Key 설정**
-   - 사용자 계정 환경 변수(`OPENROUTER_API_KEY`)가 설정되어 있어야 LLM 및 VLM 번역 모델을 호출할 수 있습니다.
-   - 앱 상단 헤더 바의 상태 인디케이터에서 `● OpenRouter API [설정됨]` 여부를 실시간으로 확인할 수 있습니다.
+1. **Antigravity CLI 및 Google 계정 로그인**
+   - 공식 `agy` 실행 파일은 앱 번들에 포함하지 않습니다. 각 사용자 환경에 별도로 설치하고 Google AI Pro 계정으로 로그인해야 합니다.
+   - 앱 상단에서 `● Antigravity 구독 CLI [사용 가능]` 상태를 확인합니다.
+   - `openrouter` 또는 `google-ai-studio` provider를 선택한 배포본에서만 별도 API 키가 필요합니다.
 
-2. **ComfyUI 인페인팅 백엔드 실행**
-   - 고품질 배경 복원(LaMa 인페인팅)을 위해 로컬 또는 원격 ComfyUI 서버(`port 8188`)가 구동 중이어야 합니다.
-   - 앱 상단 헤더 바에서 `● ComfyUI [정상 (8188)]` 초록색 신호등이 켜져 있는지 확인 후 배치 작업을 시작하세요.
+2. **로컬 LaMa ONNX 모델**
+   - 기본 인페인팅은 `models/lama.onnx`를 로컬에서 실행하므로 ComfyUI 서버가 필요하지 않습니다.
+   - 모델이 없으면 제한적인 Flat Fill/OpenCV 경로로 폴백합니다.

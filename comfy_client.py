@@ -246,7 +246,8 @@ def flat_fill(image: Image.Image, mask: Image.Image,
             # 어두운 외곽선 노이즈 영향을 안 받는 중앙값(median)으로 배경 판별
             median_brightness = np.median(bg_pixels)
 
-            if median_brightness > 210:  # ← WHITE / near-white background
+            background_std = float(np.std(bg_pixels))
+            if median_brightness > 210 and background_std < 35:  # flat white / near-white only
                 fill_color = (255, 255, 255)
                 # 안티에일리싱(계단현상) 회색 픽셀 잔상을 완전히 제거하기 위해 여유롭게 확장된 마스크 클리닝
                 clean_mask = ndimage.binary_dilation(roi_mask > 20, iterations=4)
@@ -256,13 +257,9 @@ def flat_fill(image: Image.Image, mask: Image.Image,
                 result[by1:by2, bx1:bx2][clean_mask] = fill_color
                 remaining[by1:by2, bx1:bx2][clean_mask] = 0
 
-                # 흰색 말풍선 내부의 파란 글자 박스를 안전하게 함께 클리닝 (글자 자국 100% 원천 봉쇄)
-                for tx1, ty1, tx2, ty2 in matched_texts:
-                    ix1, iy1 = max(bx1 + 2, tx1), max(by1 + 2, ty1)
-                    ix2, iy2 = min(bx2 - 2, tx2), min(by2 - 2, ty2)
-                    if ix2 > ix1 and iy2 > iy1:
-                        result[iy1:iy2, ix1:ix2] = fill_color
-                        remaining[iy1:iy2, ix1:ix2] = 0
+                # Never fill the whole text rectangle: it creates visible
+                # blocks on gradients and screentones. Threshold augmentation
+                # upstream is responsible for adding missed glyph pixels.
             # tone → leave in remaining for LaMa
 
     else:

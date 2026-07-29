@@ -91,7 +91,7 @@ def main():
         sys.exit(1)
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from main import process_page, load_config
+    from main import _provider_has_credentials, load_config, process_page
 
     config = load_config(args.config)
     if args.output:
@@ -106,8 +106,12 @@ def main():
                     if line.startswith("OPENROUTER_API_KEY="):
                         api_key = line.split("=", 1)[1].strip().strip("\"'")
                         break
-    if not api_key:
-        logger.warning("No API key — skipping OCR and translation (detection + inpainting only)")
+    providers = {
+        config.get("ocr", {}).get("provider", "openrouter"),
+        config.get("translation", {}).get("provider", "openrouter"),
+    }
+    if not any(_provider_has_credentials(provider, api_key) for provider in providers):
+        logger.warning("No configured model credentials/backend — OCR and translation will fail closed")
 
     # ── Resume / skip-existing ───────────────────────────────────────────
 

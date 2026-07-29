@@ -224,6 +224,28 @@ def save_env_api_key(key: str):
         print(f"Error writing .env: {e}")
 
 
+def configured_model_access(api_key: str) -> tuple[bool, str]:
+    """Return whether the configured OCR/translation providers can be used."""
+    try:
+        from main import _provider_has_credentials, load_config
+
+        config = load_config(str(REPO_ROOT / "config.yaml"))
+        providers = {
+            config.get("ocr", {}).get("provider", "openrouter"),
+            config.get("translation", {}).get("provider", "openrouter"),
+        }
+        available = all(_provider_has_credentials(provider, api_key) for provider in providers)
+        if providers == {"antigravity-cli"}:
+            return available, "Antigravity 구독 CLI"
+        if providers == {"openrouter"}:
+            return available, "OpenRouter API"
+        if providers == {"google-ai-studio"}:
+            return available, "Google AI Studio API"
+        return available, ", ".join(sorted(providers))
+    except Exception:
+        return bool(api_key), "OpenRouter API"
+
+
 # ── 드래그 앤 드롭 전용 프레임 ──────────────────────────────────────────
 class DropZoneFrame(QFrame):
     folders_dropped = pyqtSignal(list)
@@ -490,7 +512,7 @@ class MangaTransDesktopApp(QMainWindow):
         self.lama_status = QLabel("● Inpainting: LaMa ONNX [확인 중]")
         self.lama_status.setObjectName("StatusText")
 
-        self.api_status = QLabel("● API Key [확인 중]")
+        self.api_status = QLabel("● 모델 연결 [확인 중]")
         self.api_status.setObjectName("StatusText")
 
         btn_api_key = QPushButton("🔑 API Key 설정")
@@ -741,14 +763,12 @@ class MangaTransDesktopApp(QMainWindow):
             self.lama_status.setText("● Inpainting: Flat Fill 기본 모드")
             self.lama_status.setStyleSheet("color: #8d929a;")
 
-        if self.api_key and self.api_key.startswith("sk-or-"):
-            self.api_status.setText("● OpenRouter API [설정됨]")
-            self.api_status.setStyleSheet("color: #38c172;")
-        elif self.api_key:
-            self.api_status.setText("● OpenRouter API [키 감지됨]")
+        model_available, provider_label = configured_model_access(self.api_key)
+        if model_available:
+            self.api_status.setText(f"● {provider_label} [사용 가능]")
             self.api_status.setStyleSheet("color: #38c172;")
         else:
-            self.api_status.setText("● OpenRouter API [미설정]")
+            self.api_status.setText(f"● {provider_label} [사용 불가]")
             self.api_status.setStyleSheet("color: #e35d6a;")
 
     def add_folders(self, paths):
@@ -779,7 +799,8 @@ class MangaTransDesktopApp(QMainWindow):
         self.lbl_page_count.setText(f"총 {total_pages} 페이지")
 
     def start_batch(self):
-        if not self.api_key:
+        model_available, provider_label = configured_model_access(self.api_key)
+        if not model_available and provider_label == "OpenRouter API":
             reply = QMessageBox.warning(
                 self,
                 "API Key 필요",
@@ -790,6 +811,13 @@ class MangaTransDesktopApp(QMainWindow):
                 self.open_api_key_dialog()
             if not self.api_key:
                 return
+        elif not model_available:
+            QMessageBox.warning(
+                self,
+                "모델 연결 필요",
+                f"{provider_label}를 사용할 수 없습니다. agy 설치 및 Antigravity 로그인을 확인해주세요.",
+            )
+            return
 
         if not self.registered_folders:
             QMessageBox.warning(self, "안내", "번역할 만화 폴더를 먼저 드래그 앤 드롭으로 추가해주세요.")

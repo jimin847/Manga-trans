@@ -1,0 +1,47 @@
+{
+  "name": "yappari-v01-private-development-slice",
+  "source_policy": "Source images stay local and are identified only by filename and SHA-256.",
+  "pages": [
+    {
+      "page_id": "010",
+      "filename": "010.jpg",
+      "sha256": "06c674d7355b0fb4f9f8dde29d58d815f031a34f853d77a2974e92f5dd205d4c",
+      "minimum_regions": 3,
+      "required_source_texts": [
+        "ごめーん！もう付き合ってる人がいるの♡",
+        "それに人間となんて付き合えないわ",
+        "効率が悪いもの!!"
+      ],
+      "reference_korean": [
+        "미안~! 나 이미 사귀는 사람 있어♡",
+        "게다가 인간이랑은 사귈 수 없어.",
+        "비효율적이잖아!!"
+      ],
+      "required_translation_any": [["비효율", "효율이 안 좋", "효율이 나쁘"]]
+    },
+    {
+      "page_id": "015",
+      "filename": "015.jpg",
+      "sha256": "542c7b6c66bbb253bc4f53bd20a441721af905cb60396a92a3fa40b034c09c3a",
+      "minimum_regions": 5,
+      "required_source_texts": [
+        "ちゃんと同意を取ってな!!",
+        "数年後"
+      ],
+      "reference_korean": [
+        "제대로 동의를 구해!!",
+        "몇 년 후――"
+      ],
+      "required_translation_terms": ["몇 년 후"],
+      "required_translation_any": [["동의를 구해", "동의를 구하", "동의를 얻", "동의를 받"]]
+    },
+    {
+      "page_id": "020",
+      "filename": "020.jpg",
+      "sha256": "16b1442f956d66e252a012d80e18d9dd27207df7fb6f52d2593fc6d6721db5c7",
+      "minimum_regions": 10,
+      "required_source_texts": ["ワナベ氏"],
+      "allowed_unresolved_regions": 1
+    }
+  ]
+}

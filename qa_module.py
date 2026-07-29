@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +26,92 @@ logging.basicConfig(
     format="%(levelname)s | %(message)s",
 )
 logger = logging.getLogger("qa")
+
+
+def has_japanese_chars(text: str | None) -> bool:
+    """Return True when text still contains Japanese kana or CJK ideographs."""
+    return bool(text and re.search(r"[\u3040-\u30ff\u3400-\u9fff]", str(text)))
+
+
+def is_replacement_ready(region: dict) -> bool:
+    """A source region may be erased only when usable replacement text exists."""
+    translation = str(region.get("translation") or "").strip()
+    return bool(
+        translation
+        and not has_japanese_chars(translation)
+        and region.get("ocr_status", "accepted") == "accepted"
+        and region.get("translation_status", "accepted") == "accepted"
+        and region.get("text_type", "dialogue") != "sfx"
+        and not region.get("skip_inpaint")
+    )
+
+
+def build_dialogue_quality_report(page_id: str, detection: dict, final_image: str) -> dict:
+    """Report replacement readiness without treating unresolved regions as success."""
+    items = []
+    translated_dialogue = 0
+    total_dialogue = 0
+    issues = []
+    regions = list(detection.get("bubbles", [])) + list(detection.get("floating_texts", []))
+
+    for region in regions:
+        ocr_text = region.get("ocr_text")
+        translation = region.get("translation")
+        text_type = region.get("text_type", "dialogue")
+        flags = []
+
+        if text_type == "sfx":
+            flags.append("sfx")
+            if region.get("skip_inpaint"):
+                flags.append("preserved")
+        else:
+            total_dialogue += 1
+            if not ocr_text or ocr_text == "[NO TEXT]":
+                flags.append("ocr_unresolved")
+                issues.append(f"{region.get('id')}: OCR unresolved")
+            elif region.get("ocr_status") == "needs_review":
+                flags.append("ocr_needs_review")
+                issues.append(f"{region.get('id')}: OCR needs review")
+            elif region.get("translation_status") == "preserved" and region.get("skip_inpaint"):
+                flags.append("preserved")
+                translated_dialogue += 1
+            elif not translation:
+                flags.append("missing_translation")
+                issues.append(f"{region.get('id')}: missing translation")
+            elif region.get("translation_status") == "needs_review":
+                flags.append("translation_needs_review")
+                issues.append(f"{region.get('id')}: translation needs review")
+            elif region.get("render_status") == "needs_review":
+                flags.append("render_needs_review")
+                issues.append(f"{region.get('id')}: manual redraw review required")
+            elif has_japanese_chars(translation):
+                flags.append("japanese_remaining")
+                issues.append(f"{region.get('id')}: Japanese remains")
+            else:
+                translated_dialogue += 1
+
+        items.append({
+            "id": region.get("id"),
+            "type": text_type,
+            "ocr_text": ocr_text,
+            "translation": translation,
+            "translation_status": region.get("translation_status"),
+            "render_status": region.get("render_status"),
+            "skip_inpaint": bool(region.get("skip_inpaint")),
+            "bbox": region.get("bbox"),
+            "flags": flags,
+        })
+
+    coverage = (translated_dialogue / total_dialogue * 100) if total_dialogue else 100.0
+    return {
+        "page_id": page_id,
+        "final_image": final_image,
+        "dialogue_coverage": round(coverage, 2),
+        "translated_dialogue": translated_dialogue,
+        "total_dialogue": total_dialogue,
+        "issues": issues,
+        "bubbles": items,
+    }
 
 
 def check_page_result(result: dict, config: dict | None = None) -> dict:
@@ -45,7 +132,11 @@ def check_page_result(result: dict, config: dict | None = None) -> dict:
     bubbles = result.get("detection", {}).get("bubbles", [])
     total_bubbles = len(bubbles)
     text_detected = sum(1 for b in bubbles if b.get("ocr_text"))
-    translated = sum(1 for b in bubbles if b.get("translation"))
+    translated = sum(
+        1 for b in bubbles
+        if b.get("translation")
+        or (b.get("translation_status") == "preserved" and b.get("skip_inpaint"))
+    )
 
     ocr_rate = (text_detected / total_bubbles * 100) if total_bubbles else 0
     trans_rate = (translated / total_bubbles * 100) if total_bubbles else 0

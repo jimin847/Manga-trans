@@ -30,8 +30,30 @@ logger = logging.getLogger("pipeline")
 _DETECTOR_CACHE = {}
 _OCR_CLIENT_CACHE = {}
 _TRANSLATOR_CACHE = {}
-OCR_CACHE_VERSION = "ocr_v4"
-TRANSLATION_CACHE_VERSION = "trans_v6"
+OCR_CACHE_VERSION = "ocr_v6"
+TRANSLATION_CACHE_VERSION = "trans_v15"
+
+
+def _load_project_secret(name: str) -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        with env_path.open() as env_file:
+            for line in env_file:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _provider_has_credentials(provider: str, api_key: str) -> bool:
+    if provider == "antigravity-cli":
+        return bool(shutil.which("agy"))
+    if provider == "google-ai-studio":
+        return bool(_load_project_secret("GOOGLE_API_KEY"))
+    return bool(api_key)
 
 
 def validate_config(config: dict, base_dir: Path = None) -> list:
@@ -70,7 +92,7 @@ def validate_config(config: dict, base_dir: Path = None) -> list:
 
     # ocr section
     provider = config.get("ocr", {}).get("provider", "")
-    valid_providers = ("openrouter", "google-ai-studio")
+    valid_providers = ("openrouter", "google-ai-studio", "antigravity-cli")
     if provider not in valid_providers:
         raise ValueError(f"ocr.provider must be one of {valid_providers}, got '{provider}'")
     if not config.get("ocr", {}).get("model"):
@@ -125,6 +147,7 @@ def get_detector(config: dict):
         config["yolo"]["conf_threshold"],
         config["yolo"]["iou_threshold"],
         config["yolo"]["device"],
+        config["yolo"].get("detection_size", 1280),
     )
     detector = _DETECTOR_CACHE.get(cache_key)
     if detector is None:
@@ -134,6 +157,7 @@ def get_detector(config: dict):
             conf_threshold=config["yolo"]["conf_threshold"],
             iou_threshold=config["yolo"]["iou_threshold"],
             device=config["yolo"]["device"],
+            image_size=config["yolo"].get("detection_size", 1280),
         )
         _DETECTOR_CACHE[cache_key] = detector
     return detector
@@ -178,6 +202,7 @@ def get_translator_client(config: dict):
     cache_key = (
         config["translation"]["provider"],
         config["translation"]["model"],
+        config["translation"].get("review_model"),
         tuple(sorted((config["translation"].get("glossary") or {}).items())),
         tuple(config["translation"].get("preserve_terms") or []),
     )
@@ -188,6 +213,8 @@ def get_translator_client(config: dict):
             translator_kwargs["glossary"] = config["translation"].get("glossary") or {}
         if "preserve_terms" in config["translation"]:
             translator_kwargs["preserve_terms"] = config["translation"].get("preserve_terms") or []
+        if "review_model" in config["translation"]:
+            translator_kwargs["review_model"] = config["translation"].get("review_model")
         client = Translator(
             provider=config["translation"]["provider"],
             model=config["translation"]["model"],
@@ -354,10 +381,41 @@ def _estimate_font_size(text: str, bubble: dict, vertical: bool, config: dict) -
     bbox_h = max(20, bbox[3] - bbox[1])
     char_count = max(1, len("".join(str(text).split())))
     if vertical:
-        return max(16, min(72, int(bbox_h / max(1, char_count) * 1.15)))
+        area_size = int(math.sqrt((bbox_w * bbox_h) / char_count) * 0.78)
+        return max(16, min(72, area_size))
     avg_chars_per_line = max(4, int(bbox_h / 42))
     chars_per_line = max(1, int(char_count / avg_chars_per_line))
     return max(16, min(72, int((bbox_w - 20) / max(chars_per_line, 1) / 0.85)))
+
+
+def _is_flat_bubble_background(
+    original: Image.Image,
+    text_mask_img: Image.Image,
+    bubble: dict,
+    config: dict,
+) -> bool:
+    """Return True only for a reliably flat, bright bubble interior."""
+    inpaint_cfg = config.get("inpainting", {})
+    x1, y1, x2, y2 = [int(v) for v in bubble["bbox"]]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(original.width, x2), min(original.height, y2)
+    inset_ratio = float(inpaint_cfg.get("flat_background_inset_ratio", 0.15))
+    dx = max(2, int((x2 - x1) * inset_ratio))
+    dy = max(2, int((y2 - y1) * inset_ratio))
+    if x2 - x1 <= dx * 2 or y2 - y1 <= dy * 2:
+        return False
+
+    gray = np.asarray(original.convert("L"))[y1 + dy:y2 - dy, x1 + dx:x2 - dx]
+    mask = np.asarray(text_mask_img.convert("L"))[y1 + dy:y2 - dy, x1 + dx:x2 - dx]
+    background = gray[mask <= 20]
+    if background.size < int(inpaint_cfg.get("flat_background_min_pixels", 100)):
+        return False
+    median = float(np.median(background))
+    bright_ratio = float(np.mean(background > 220))
+    return (
+        median >= float(inpaint_cfg.get("flat_background_min_median", 210))
+        and bright_ratio >= float(inpaint_cfg.get("flat_background_min_bright_ratio", 0.80))
+    )
 
 
 def _add_left_margin_vertical_text_mask(original: Image.Image, result: dict, config: dict) -> None:
@@ -370,7 +428,7 @@ def _add_left_margin_vertical_text_mask(original: Image.Image, result: dict, con
     """
     import cv2
 
-    mask = result.get("text_mask")
+    mask = result.get("floating_text_mask")
     if mask is None:
         return
 
@@ -419,7 +477,7 @@ def _add_left_margin_vertical_text_mask(original: Image.Image, result: dict, con
         extra[y1:y2, x1:x2 + 1] = np.maximum(extra[y1:y2, x1:x2 + 1], local[y1:y2, x1:x2 + 1].astype(np.uint8) * 255)
 
     if np.any(extra):
-        result["text_mask"] = np.maximum(mask, extra).astype(np.uint8)
+        result["floating_text_mask"] = np.maximum(mask, extra).astype(np.uint8)
 
 
 def _add_threshold_text_mask(original: Image.Image, result: dict, config: dict) -> None:
@@ -432,7 +490,10 @@ def _add_threshold_text_mask(original: Image.Image, result: dict, config: dict) 
     import cv2
 
     mask = result.get("text_mask")
-    targets = list(result.get("texts") or [])
+    targets = [
+        text for text in (result.get("texts") or [])
+        if text.get("in_bubble", True)
+    ]
     if not targets:
         targets = list(result.get("bubbles") or [])
     if mask is None or not targets:
@@ -448,6 +509,10 @@ def _add_threshold_text_mask(original: Image.Image, result: dict, config: dict) 
     extra = np.zeros_like(arr, dtype=np.uint8)
     h, w = arr.shape
     kernel = np.ones((3, 3), np.uint8)
+    support_dilate = int(inpaint_cfg.get("text_threshold_support_dilate", 4))
+    support = cv2.dilate(
+        (mask > 20).astype(np.uint8), kernel, iterations=max(0, support_dilate)
+    ) > 0
 
     for target in targets:
         bx1, by1, bx2, by2 = [int(v) for v in target["bbox"]]
@@ -459,11 +524,14 @@ def _add_threshold_text_mask(original: Image.Image, result: dict, config: dict) 
         if dilate > 0:
             local = cv2.dilate(local.astype(np.uint8), kernel, iterations=dilate) > 0
         local = cv2.morphologyEx(local.astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=1) > 0
+        support_slice = support[by1:by2, bx1:bx2]
+        if np.any(support_slice):
+            local &= support_slice
         if min_component > 0:
             count, labels, stats, _ = cv2.connectedComponentsWithStats(local.astype(np.uint8), connectivity=8)
             keep = np.zeros_like(local, dtype=np.uint8)
             for i in range(1, count):
-                if stats[i, cv2.CC_STAT_AREA] >= min_component:
+                if min_component <= stats[i, cv2.CC_STAT_AREA] <= max_component:
                     keep[labels == i] = 255
             local = keep > 0
         extra_slice = extra[by1:by2, bx1:bx2]
@@ -586,7 +654,12 @@ def run_ocr(detection: dict, original: Image.Image, config: dict, api_key: str, 
         return
 
     def prepare_bubble(bubble):
-        crop = _prepare_ocr_crop(original, bubble, detection.get("all_text_mask", detection.get("text_mask")), config)
+        tight_crop = _prepare_ocr_crop(
+            original,
+            bubble,
+            detection.get("all_text_mask", detection.get("text_mask")),
+            config,
+        )
         x1, y1, x2, y2 = [int(v) for v in bubble["bbox"]]
 
         bw, bh = x2 - x1, y2 - y1
@@ -597,22 +670,37 @@ def run_ocr(detection: dict, original: Image.Image, config: dict, api_key: str, 
             orientation = "horizontal"
         bubble["orientation"] = orientation
 
-        upscale = config["ocr"].get("crop_upscale", 2)
-        if upscale > 1:
-            crop = crop.resize((crop.width * upscale, crop.height * upscale))
+        variants = [("tight", tight_crop)]
+        if config.get("ocr", {}).get("multi_view", False):
+            context_crop = original.crop((
+                max(0, x1),
+                max(0, y1),
+                min(original.width, x2),
+                min(original.height, y2),
+            ))
+            upscale = int(config.get("ocr", {}).get("crop_upscale", 2) or 1)
+            if upscale > 1:
+                context_crop = context_crop.resize((
+                    context_crop.width * upscale,
+                    context_crop.height * upscale,
+                ))
+            variants.append(("context", context_crop))
 
-        if config["output"].get("save_crops", True):
-            crop_path = tmp_dir / f"{detection['page_id']}_{bubble['id']}_crop.png"
-            crop.save(crop_path)
-
-        buf = BytesIO()
-        crop.save(buf, format="PNG")
-        crop_hash = cache.hash_image(buf.getvalue())
-        return bubble, crop, orientation, crop_hash
+        prepared_variants = []
+        for label, crop in variants:
+            if config["output"].get("save_crops", True):
+                crop_path = tmp_dir / f"{detection['page_id']}_{bubble['id']}_{label}_crop.png"
+                crop.save(crop_path)
+            buf = BytesIO()
+            crop.save(buf, format="PNG")
+            prepared_variants.append((label, crop, cache.hash_image(buf.getvalue())))
+        return bubble, orientation, prepared_variants
 
     def process_unique_crop(crop, orientation, crop_hash, bubble_id):
         # Check Cache
-        cache_key = f"{OCR_CACHE_VERSION}_{crop_hash}"
+        ocr_cfg = config.get("ocr", {})
+        model_identity = f"{ocr_cfg.get('provider')}:{ocr_cfg.get('model')}:{ocr_cfg.get('fallback_model')}"
+        cache_key = f"{OCR_CACHE_VERSION}_{model_identity}_{crop_hash}"
         cached_text = cache.get(cache_key)
 
         if cached_text is not None:
@@ -632,32 +720,128 @@ def run_ocr(detection: dict, original: Image.Image, config: dict, api_key: str, 
         return ocr_text
 
     bubble_prepared = [prepare_bubble(b) for b in all_targets]
-    hash_to_bubbles = {}
+    hash_to_assignments = {}
     unique_jobs = []
-    for bubble, crop, orientation, crop_hash in bubble_prepared:
-        hash_to_bubbles.setdefault(crop_hash, []).append(bubble)
-        if len(hash_to_bubbles[crop_hash]) == 1:
-            unique_jobs.append((bubble, crop, orientation, crop_hash))
+    for bubble, orientation, variants in bubble_prepared:
+        bubble["_ocr_views"] = {}
+        for label, crop, crop_hash in variants:
+            hash_to_assignments.setdefault(crop_hash, []).append((bubble, label))
+            if len(hash_to_assignments[crop_hash]) == 1:
+                unique_jobs.append((bubble, crop, orientation, crop_hash, label))
 
     max_workers = config.get("ocr", {}).get("max_workers", 4)
-    is_google = config.get("ocr", {}).get("provider") == "google-ai-studio"
+    ocr_provider = config.get("ocr", {}).get("provider")
+    is_google = ocr_provider == "google-ai-studio"
     # Google AI Studio free tier has 20 req/min — serialize + throttle to avoid 429
     if is_google and max_workers > 1:
         max_workers = 1
         logger.info("  Google AI Studio: serializing OCR (max_workers=1)")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        import time
-        futures = {}
-        for bubble, crop, orientation, crop_hash in unique_jobs:
-            if is_google:
-                time.sleep(3)  # Throttle: 20 req/min → 1 req per 3s
-            future = executor.submit(process_unique_crop, crop, orientation, crop_hash, bubble["id"])
-            futures[future] = crop_hash
-        for future in as_completed(futures):
-            crop_hash = futures[future]
-            text = future.result()
-            for bubble in hash_to_bubbles[crop_hash]:
-                bubble["ocr_text"] = text
+    if ocr_provider == "antigravity-cli":
+        resolved_by_hash = {}
+        pending_jobs = []
+        for index, (bubble, crop, orientation, crop_hash, label) in enumerate(unique_jobs, start=1):
+            ocr_cfg = config.get("ocr", {})
+            model_identity = f"{ocr_cfg.get('provider')}:{ocr_cfg.get('model')}:{ocr_cfg.get('fallback_model')}"
+            cache_key = f"{OCR_CACHE_VERSION}_{model_identity}_{crop_hash}"
+            cached_text = cache.get(cache_key)
+            if cached_text is not None:
+                resolved_by_hash[crop_hash] = None if cached_text == "[NO TEXT]" else cached_text
+                logger.info(f"  OCR {bubble['id']} (cached): '{cached_text[:60]}'")
+                continue
+            pending_jobs.append((f"r{index:04d}", crop, orientation, crop_hash, cache_key, bubble["id"], label))
+
+        cli_batch_size = max(1, int(config.get("ocr", {}).get("batch_max_items", 12)))
+        for chunk_start in range(0, len(pending_jobs), cli_batch_size):
+            chunk = pending_jobs[chunk_start: chunk_start + cli_batch_size]
+            logger.info(
+                "  Antigravity OCR: batch %d/%d (%d crop views)",
+                chunk_start // cli_batch_size + 1,
+                math.ceil(len(pending_jobs) / cli_batch_size),
+                len(chunk),
+            )
+            batch_result = ocr.read_batch([
+                (job_id, crop, orientation)
+                for job_id, crop, orientation, _, _, _, _ in chunk
+            ])
+            for job_id, _, orientation, crop_hash, cache_key, bubble_id, _ in chunk:
+                if job_id not in batch_result:
+                    logger.error(f"  OCR {bubble_id} ({orientation}): CLI omitted result; leaving unresolved")
+                    resolved_by_hash[crop_hash] = None
+                    continue
+                text = batch_result[job_id]
+                resolved_by_hash[crop_hash] = text
+                cache.set(cache_key, text or "[NO TEXT]")
+                logger.info(
+                    f"  OCR {bubble_id} ({orientation}): '{text[:60]}'" if text
+                    else f"  OCR {bubble_id} ({orientation}): [NO TEXT]"
+                )
+
+        for crop_hash, assignments in hash_to_assignments.items():
+            text = resolved_by_hash.get(crop_hash)
+            for bubble, label in assignments:
+                bubble["_ocr_views"][label] = text
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            import time
+            futures = {}
+            for bubble, crop, orientation, crop_hash, _ in unique_jobs:
+                if is_google:
+                    time.sleep(3)  # Throttle: 20 req/min → 1 req per 3s
+                future = executor.submit(process_unique_crop, crop, orientation, crop_hash, bubble["id"])
+                futures[future] = crop_hash
+            for future in as_completed(futures):
+                crop_hash = futures[future]
+                text = future.result()
+                for bubble, label in hash_to_assignments[crop_hash]:
+                    bubble["_ocr_views"][label] = text
+
+    def normalized_ocr(text):
+        import unicodedata
+
+        return re.sub(
+            r"\s+", "", unicodedata.normalize("NFKC", str(text or ""))
+        ).strip()
+
+    multi_view = bool(config.get("ocr", {}).get("multi_view", False))
+    for bubble in all_targets:
+        views = bubble.pop("_ocr_views", {})
+        nonempty = [text for text in views.values() if text]
+        if not nonempty:
+            bubble["ocr_text"] = None
+            bubble["ocr_status"] = "unresolved"
+            continue
+        bubble["ocr_text"] = nonempty[0]
+        agreeing = len(views) >= 2 and len(nonempty) == len(views) and len({normalized_ocr(text) for text in nonempty}) == 1
+        bubble["ocr_status"] = "accepted" if not multi_view or agreeing else "needs_review"
+        if bubble["ocr_status"] == "needs_review":
+            bubble["ocr_candidates"] = list(dict.fromkeys(nonempty))
+            logger.warning(f"  OCR {bubble['id']}: views disagree or one view failed; review required")
+
+
+def _sort_manga_reading_order(regions: list[dict]) -> list[dict]:
+    """Best-effort Japanese page order: rows top-down, each row right-to-left."""
+    heights = [
+        max(1.0, float(region["bbox"][3]) - float(region["bbox"][1]))
+        for region in regions
+        if len(region.get("bbox") or []) == 4
+    ]
+    if not heights:
+        return list(regions)
+
+    row_band = max(1.0, float(np.median(heights)) * 0.75)
+
+    def key(indexed_region):
+        index, region = indexed_region
+        bbox = region.get("bbox")
+        if not bbox or len(bbox) != 4:
+            return (10**9, index, index)
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        row = int(center_y / row_band)
+        return (row, -center_x, index)
+
+    return [region for _, region in sorted(enumerate(regions), key=key)]
 
 
 def run_translation(
@@ -712,80 +896,13 @@ def run_translation(
             return False
         return True
 
+    def punctuation_only(text: str) -> bool:
+        return bool(re.fullmatch(r"[\s.!?…。・…！？~〜～♡♥♪ー—―]+", str(text or "")))
+
     def clean_translation_artifacts(text: str, source_text: str) -> str:
-        cleaned = str(text or "")
-        cleaned = cleaned.replace("일생마모", "").replace("일생 마모", "")
-        cleaned = cleaned.replace("평생\n평생 지켜줄게", "평생 지켜줄게")
-        cleaned = cleaned.replace("평생 지켜줄게\n평생 지켜줄게", "평생 지켜줄게")
-        cleaned = cleaned.replace("잘 부탁해요♡", "잘 부탁해♡")
-        cleaned = cleaned.replace("잘 부탁해요", "잘 부탁해")
-        if re.search(r"[가-힣]\.\.\.", cleaned[:4]) and re.search(r"가\.\.\.", cleaned):
-            cleaned = re.sub(r"^가\.\.\.", "하지만…", cleaned)
-        if "가…" in cleaned and "평생" in cleaned:
-            cleaned = cleaned.replace("가…", "하지만…")
-        if (
-            ("一生守る" in source_text or "いっしょうまも" in source_text)
-            and "평생" in cleaned
-            and ("지켜" in cleaned or "지킬" in cleaned)
-        ):
-            lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-            filtered = []
-            for line in lines:
-                if line == "평생" and any(
-                    "평생" in other and ("지킬" in other or "지켜" in other)
-                    for other in lines
-                ):
-                    continue
-                filtered.append(line)
-            cleaned = "\n".join(filtered)
-        if ("一生守る" in source_text or "いっしょうまも" in source_text) and "평생" in cleaned:
-            lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-            for i, line in enumerate(lines):
-                if "평생" in line:
-                    lines = lines[i:]
-                    break
-            if lines and "지켜" in lines[-1] and "줄게" not in lines[-1] and "지킬게" not in lines[-1]:
-                lines[-1] = "지켜줄게…"
-            filtered = []
-            for line in lines:
-                if any(
-                    "평생" in existing and "평생" in line and
-                    ("지킬" in existing or "지켜줄" in existing) and
-                    ("지킬" in line or "지켜줄" in line)
-                    for existing in filtered
-                ):
-                    continue
-                filtered.append(line)
-            cleaned = "\n".join(filtered)
-        if "が…" in source_text and cleaned.startswith("가"):
-            cleaned = "하지만…" + cleaned[1:]
-        cleaned = re.sub(r"[ \t]+", " ", cleaned)
-        cleaned = cleaned.replace("얼굴과몸", "얼굴과 몸")
-        cleaned = cleaned.replace("마음대로고를", "마음대로 고를")
-        cleaned = cleaned.replace("수있잖아", "수 있잖아")
-        cleaned = cleaned.replace("진짜직구", "진짜 직구")
-        cleaned = cleaned.replace("평생 지켜 지켜줄 게", "평생 지켜줄게")
-        cleaned = cleaned.replace("평생 지켜 지켜줄", "평생 지켜줄")
-        cleaned = cleaned.replace("평생 지켜\n평생 지켜줄 게", "평생 지켜줄게")
-        cleaned = cleaned.replace("평생 지켜\n평생", "평생")
-        cleaned = cleaned.replace("무다모도 안 나와!!!", "불필요한 털도 안 나와!!!")
-        cleaned = cleaned.replace("무다모도 안나와!!!", "불필요한 털도 안 나와!!!")
-        cleaned = cleaned.replace("무다모도 안 나와 있어!!!", "불필요한 털도 안 나와!!!")
-        cleaned = cleaned.replace("불필요한 털도 안 나와 있어!!!", "불필요한 털도 안 나와!!!")
-        cleaned = cleaned.replace("난폭하지 말고\n바람도 하지 말고", "난폭하지 않아\n바람도 안 해")
-        cleaned = cleaned.replace("난폭하지 말고 바람도 하지 말고", "난폭하지 않아 바람도 안 해")
-        cleaned = cleaned.replace("이제는\n한 점의 근심도 없어!!", "이제는 근심이 하나도 없어!!")
-        cleaned = cleaned.replace("무한히 잘해주고, 그럼에도 대가도 요구하지 않아", "무한히 잘해주는데 대가도 요구하지 않아")
-        cleaned = cleaned.replace("무한히 잘해주고 그럼에도 대가도 요구하지 않아", "무한히 잘해주는데 대가도 요구하지 않아")
-        cleaned = cleaned.replace("무엇보다\n새롭게 관계를\n만드는데 필요한\n시간도 노력도\n필요 없다는\n대단해~", "무엇보다 새로 관계를 맺는 데 필요한 시간도 노력도 필요 없다는 게 대단해~")
-        cleaned = cleaned.replace("새롭게 관계를 만드는데 필요한", "새 관계를 만드는 데 필요한")
-        cleaned = cleaned.replace("필요 없다는 게\n큰거", "필요 없다는 게 큰거")
-        cleaned = cleaned.replace("필요 없다는\n대단해~", "필요 없다는 게 대단해~")
-        cleaned = cleaned.replace("필요 없다고\n대단해~", "필요 없다는 게 대단해~")
-        cleaned = cleaned.replace("필요 없다고 대단해~", "필요 없다는 게 대단해~")
-        cleaned = cleaned.replace("잘해 주고", "잘해주고")
-        cleaned = "\n".join(line.strip() for line in cleaned.splitlines()).strip()
-        return cleaned
+        # Content corrections belong to the glossary/editor review, not corpus-specific rewrites.
+        cleaned = re.sub(r"[ \t]+", " ", str(text or ""))
+        return "\n".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
 
     def is_usable_translation(res: dict, source_text: str) -> bool:
         trans = str(res.get("translation") or "").strip()
@@ -797,16 +914,34 @@ def run_translation(
             return False
         if len(trans) < 2:
             return False
+        core = re.sub(r"[\s.!?…。！？~〜～♡♥♪]+$", "", trans)
+        if core.endswith("고서"):
+            return False
+        if re.search(r"(?:소이다|하오이다|이오이다)(?=[\s.!?…。！？~〜～♡♥♪]|$)", trans):
+            return False
+        source_tail = re.search(r"([!！?？]+)[\s♡♥♪]*$", str(source_text))
+        if source_tail:
+            target_tail = re.search(r"([!！?？]+)[\s♡♥♪]*$", trans)
+            if not target_tail:
+                return False
+            source_marks = source_tail.group(1)
+            target_marks = target_tail.group(1)
+            if ("?" in source_marks or "？" in source_marks) and not (
+                "?" in target_marks or "？" in target_marks
+            ):
+                return False
+            if ("!" in source_marks or "！" in source_marks) and not (
+                "!" in target_marks or "！" in target_marks
+            ):
+                return False
         return True
 
     def strict_retry_instruction(item: dict) -> str:
         return (
             "Strict retry for one manga speech bubble. "
-            "Return exactly one natural Korean translation for the source text. "
-            "Do NOT preserve Japanese Kanji, Hiragana, Katakana, names, honorifics, or particles. "
-            "Translate titles naturally: 旦那様→남편님, 様→님, さん/氏→씨, ちゃん→쨩, 先輩→선배, 先生→선생님. "
-            "Translate literal traps naturally: 一生→평생, 最早→이제는, 不束者ですが→서툴지만/서툰 사람인데, "
-            "一片の憂い無し→한 점의 근심도 없어, いっしょうまも/一生守る→평생 지켜줄게. "
+            "Return exactly one faithful, idiomatic Korean translation for the source text. "
+            "Preserve meaning, speaker register, negation, numbers, names, honorific intent, and subtext. "
+            "Do not retain Japanese glyphs or copy Japanese syntax. "
             f"Source text: {item['text']}"
         )
 
@@ -830,10 +965,19 @@ def run_translation(
 
     texts_to_translate = []
     text_to_bubble_ids = {}
-    all_targets = detection["bubbles"] + detection.get("floating_texts", [])
+    all_targets = _sort_manga_reading_order(
+        detection["bubbles"] + detection.get("floating_texts", [])
+    )
     for bubble in all_targets:
         ocr_text = bubble.get("ocr_text")
         if ocr_text and ocr_text != "[NO TEXT]":
+            if punctuation_only(ocr_text):
+                bubble["translation"] = None
+                bubble["translation_status"] = "preserved"
+                bubble["text_type"] = "dialogue"
+                bubble["skip_inpaint"] = True
+                logger.info(f"  Punctuation-only text preserved for {bubble['id']}")
+                continue
             text_key = normalize_translation_key(ocr_text)
             text_to_bubble_ids.setdefault(text_key, []).append(bubble["id"])
             if len(text_to_bubble_ids[text_key]) == 1:
@@ -851,6 +995,7 @@ def run_translation(
     cache_payload = {
         "texts": texts_to_translate,
         "previous_context": previous_context or [],
+        "quality_review": bool(config["translation"].get("quality_review", False)),
     }
     payload_str = json.dumps(cache_payload, ensure_ascii=False)
     payload_hash = cache.hash_text(payload_str)
@@ -866,13 +1011,12 @@ def run_translation(
         if hasattr(translator, "check_auth") and not translator.check_auth(api_key):
             logger.error("  Translation auth failed — skipping translation for this page")
             return
-        # Split large batches to avoid LLM output truncation. Process in chunks of max 2 items.
-        import math
-        BATCH_CHUNK_SIZE = 2
+        # Keep page context intact; split only unusually dense pages.
+        batch_chunk_size = max(1, int(config["translation"].get("batch_max_items", 12)))
         all_results = []
-        for chunk_start in range(0, len(texts_to_translate), BATCH_CHUNK_SIZE):
-            chunk = texts_to_translate[chunk_start: chunk_start + BATCH_CHUNK_SIZE]
-            logger.info(f"  Translation: Chunk {chunk_start // BATCH_CHUNK_SIZE + 1}/{math.ceil(len(texts_to_translate) / BATCH_CHUNK_SIZE)} ({len(chunk)} bubbles)")
+        for chunk_start in range(0, len(texts_to_translate), batch_chunk_size):
+            chunk = texts_to_translate[chunk_start: chunk_start + batch_chunk_size]
+            logger.info(f"  Translation: Chunk {chunk_start // batch_chunk_size + 1}/{math.ceil(len(texts_to_translate) / batch_chunk_size)} ({len(chunk)} bubbles)")
             chunk_result = translator.translate_batch(
                 chunk,
                 api_key=api_key,
@@ -894,6 +1038,51 @@ def run_translation(
                         result_by_id[res["id"]] = res
             all_results.extend(result_by_id[item["id"]] for item in chunk if item["id"] in result_by_id)
         batch_result = all_results if all_results else None
+        if batch_result and config["translation"].get("quality_review", False):
+            reviewed = translator.review_batch(
+                texts_to_translate,
+                batch_result,
+                api_key=api_key,
+                previous_context=previous_context,
+            )
+            if reviewed:
+                draft_by_id = {item["id"]: item for item in batch_result}
+                reviewed_by_id = {item.get("id"): item for item in reviewed if item.get("id")}
+                reviewed_results = []
+                for item in texts_to_translate:
+                    draft = draft_by_id.get(item["id"])
+                    if not draft:
+                        continue
+                    candidate = reviewed_by_id.get(item["id"])
+                    if candidate and is_usable_translation(candidate, item["text"]):
+                        selected = dict(candidate)
+                        selected["translation_status"] = "accepted"
+                    else:
+                        logger.warning(
+                            "  Editor output failed completeness validation for %s; retrying review individually",
+                            item["id"],
+                        )
+                        retried_review = translator.review_batch(
+                            [item],
+                            [draft],
+                            api_key=api_key,
+                            previous_context=previous_context,
+                        )
+                        retried_candidate = retried_review[0] if retried_review else None
+                        if retried_candidate and is_usable_translation(retried_candidate, item["text"]):
+                            selected = dict(retried_candidate)
+                            selected["translation_status"] = "accepted"
+                        else:
+                            selected = dict(draft)
+                            selected["translation_status"] = "needs_review"
+                    reviewed_results.append(selected)
+                batch_result = reviewed_results
+                logger.info("  Translation: independent editor review applied")
+            else:
+                batch_result = [dict(item, translation_status="needs_review") for item in batch_result]
+                logger.warning("  Translation: editor review failed; keeping validated draft")
+        elif batch_result:
+            batch_result = [dict(item, translation_status="accepted") for item in batch_result]
         if batch_result:
             cache.set(cache_key, json.dumps(batch_result, ensure_ascii=False))
             translations_dict = {t["id"]: t for t in batch_result}
@@ -927,11 +1116,20 @@ def run_translation(
             skip_sfx = config.get("typesetting", {}).get("skip_sfx", True)
             if skip_sfx and text_type == "sfx":
                 bubble["translation"] = None
+                bubble["translation_status"] = "preserved"
                 bubble["skip_inpaint"] = True
                 logger.info(f"  SFX skipped for {bubble['id']}")
                 continue
             bubble["translation"] = trans
+            bubble["translation_status"] = res.get("translation_status", "accepted")
             bubble["skip_inpaint"] = False
+            if (
+                bubble.get("type") == "floating_text"
+                and config.get("inpainting", {}).get("floating_text_strategy") == "preserve"
+            ):
+                bubble["render_status"] = "needs_review"
+                bubble["skip_inpaint"] = True
+                logger.info(f"  Preserved floating text {bubble['id']} for manual redraw review")
             if trans:
                 logger.info(f"  Trans {bubble['id']} [{text_type}]: '{trans[:40]}'")
 
@@ -953,21 +1151,34 @@ def run_inpainting(
         if config["inpainting"].get("preserve_bubble_shape", True):
             text_mask_img = _clip_text_mask_to_text_bboxes(text_mask_img, detection, config)
 
-    # Protect bubbles with failed translation from being erased
-    if text_mask_img is not None:
+    from qa_module import is_replacement_ready
+
+    if (
+        text_mask_img is not None
+        and config.get("inpainting", {}).get("preserve_textured_bubbles", False)
+    ):
         for bubble in detection.get("bubbles", []):
-            if bubble.get("translation") is None and bubble.get("ocr_text") and bubble["ocr_text"] != "[NO TEXT]":
+            if is_replacement_ready(bubble) and not _is_flat_bubble_background(
+                original, text_mask_img, bubble, config
+            ):
+                bubble["render_status"] = "needs_review"
+                bubble["skip_inpaint"] = True
+                logger.info(f"  Preserved textured bubble {bubble['id']} for manual redraw review")
+
+    # Never erase source text until a usable replacement is ready.
+    if text_mask_img is not None:
+        mask_arr = np.array(text_mask_img)
+        for bubble in detection.get("bubbles", []):
+            if not is_replacement_ready(bubble):
                 bx1, by1, bx2, by2 = [int(v) for v in bubble["bbox"]]
                 nx1 = max(0, bx1)
                 ny1 = max(0, by1)
                 nx2 = min(text_mask_img.width, bx2)
                 ny2 = min(text_mask_img.height, by2)
                 if nx2 > nx1 and ny2 > ny1:
-                    import numpy as np
-                    arr = np.array(text_mask_img)
-                    arr[ny1:ny2, nx1:nx2] = 0
-                    text_mask_img = Image.fromarray(arr)
-                    logger.info(f"  Protected bubble {bubble['id']} from inpainting (translation failed)")
+                    mask_arr[ny1:ny2, nx1:nx2] = 0
+                    logger.info(f"  Protected bubble {bubble['id']} from inpainting (replacement not ready)")
+        text_mask_img = Image.fromarray(mask_arr)
         if config["inpainting"].get("dialogue_only", True):
             text_mask_img = _exclude_bubbles_from_text_mask(text_mask_img, detection.get("bubbles", []))
 
@@ -1038,15 +1249,6 @@ def _plan_vertical_text(text: str, bbox: list[int], config: dict) -> str:
     max_chars_per_col = max(1, int((bbox_h - padding) / max(line_height, 1)))
     char_step = max(1, int(font_size * avg_char_w))
     max_cols = max(1, int((bbox_w - padding) / max(char_step, 1)))
-    if " " in text:
-        columns: list[str] = []
-        for segment in text.split():
-            if not segment:
-                continue
-            for i in range(0, len(segment), max_chars_per_col):
-                columns.append(segment[i:i + max_chars_per_col])
-        if columns:
-            return "\n".join(columns)
     chars = [ch for ch in text if not ch.isspace()]
     columns = []
     for i in range(0, len(chars), max_chars_per_col):
@@ -1062,6 +1264,13 @@ def _plan_vertical_text(text: str, bbox: list[int], config: dict) -> str:
 
 def _plan_korean_lines(text: str, bbox: list[int], config: dict) -> str:
     """Insert conservative Korean line breaks before QPainter rendering."""
+    def split_without_orphaning_punctuation(value: str, limit: int) -> list[str]:
+        chunks = [value[i:i + limit] for i in range(0, len(value), limit)]
+        if len(chunks) >= 2 and re.fullmatch(r"[!?！？…♡♥♪~〜～]+", chunks[-1]):
+            trailing_punctuation = chunks.pop()
+            chunks[-1] += trailing_punctuation
+        return chunks
+
     typeset_cfg = config.get("typesetting", {})
     target_font_size = float(typeset_cfg.get("target_font_size", 42))
     avg_char_width = float(typeset_cfg.get("avg_char_width", 0.85))
@@ -1096,14 +1305,14 @@ def _plan_korean_lines(text: str, bbox: list[int], config: dict) -> str:
             if current:
                 lines.append(current)
         else:
-            lines = [paragraph[i:i + chars_per_line] for i in range(0, len(paragraph), chars_per_line)]
+            lines = split_without_orphaning_punctuation(paragraph, chars_per_line)
         planned.extend(lines)
     refined: list[str] = []
     for line in planned:
         if len(line) <= chars_per_line:
             refined.append(line)
         else:
-            refined.extend(line[i:i + chars_per_line] for i in range(0, len(line), chars_per_line))
+            refined.extend(split_without_orphaning_punctuation(line, chars_per_line))
     planned = refined
     if len(planned) > max_lines:
         # Do not force narrower wrapping; it often increases line count.
@@ -1124,25 +1333,40 @@ def run_typesetting(
     Saves typeset_plan to tmp_dir; writes final _ko.png to tmp_dir.
     Caller copies _ko.png to output dir.
     """
+    from qa_module import is_replacement_ready
+
     # Build typeset_plan from detection bubbles + translations
     typeset_plans = []
-    for bubble in detection["bubbles"]:
+    all_regions = detection["bubbles"] + detection.get("floating_texts", [])
+    for bubble in all_regions:
         trans = bubble.get("translation")
-        if not trans:
+        if not trans or not is_replacement_ready(bubble):
             continue
-            
+
+        is_floating = bubble.get("type") == "floating_text"
         text_type = bubble.get("text_type", "dialogue")
-        style = "normal"
+        style = "floating" if is_floating else "normal"
         font_policy = "auto"
         
         if text_type == "thought":
-            style = "italic"
+            style = "thought"
         elif text_type == "sfx":
-            style = "bold"
+            style = "shout"
             font_policy = "sfx"
         bbox = [int(v) for v in bubble["bbox"]]
-        bbox = _shrink_bbox_for_typesetting(bbox, config)
-        vertical = bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 1.8
+        if is_floating:
+            pad = int(config.get("typesetting", {}).get("floating_padding", 2))
+            bbox = [bbox[0] + pad, bbox[1] + pad, bbox[2] - pad, bbox[3] - pad]
+        else:
+            bbox = _shrink_bbox_for_typesetting(bbox, config)
+        # Speech bubbles use readable horizontal Korean. Floating source text
+        # may keep a multi-column vertical composition to cover its original
+        # footprint without placing a destructive rectangular patch over art.
+        if is_floating:
+            vertical = bool(config.get("typesetting", {}).get("vertical_floating_korean", True))
+        else:
+            vertical = bool(config.get("typesetting", {}).get("vertical_korean", False))
+        vertical = vertical and bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 1.3
         typeset_plans.append({
             "id": bubble["id"],
             "action": "translate_replace",
@@ -1153,6 +1377,10 @@ def run_typesetting(
             "align": "center",
             "font_policy": font_policy,
             "estimated_font_size": _estimate_font_size(trans, bubble, vertical, config),
+            "safe_width_ratio": float(config.get("typesetting", {}).get(
+                "floating_safe_width_ratio" if is_floating else "safe_width_ratio",
+                0.95 if is_floating else 0.82,
+            )),
         })
 
     if not typeset_plans:
@@ -1207,11 +1435,16 @@ def run_genai_replacement(
     page_id: str,
 ) -> Path:
     """Step 5.5: Replace floating/background texts using Generative AI model or replacement pipeline."""
-    floating = [f for f in detection.get("floating_texts", []) if f.get("translation")]
+    from qa_module import is_replacement_ready
+
+    floating = [
+        f for f in detection.get("floating_texts", [])
+        if f.get("translation") and is_replacement_ready(f)
+    ]
     if not floating or not config.get("inpainting", {}).get("enable_genai_floating_text", True):
         return image_path
 
-    logger.info(f"[{page_id}] === GenAI Floating Text Replacement ({len(floating)} regions) ===")
+    logger.info(f"[{page_id}] === Safe Floating Text Knockout ({len(floating)} regions) ===")
     from inpainting.genai_inpainter import GenAIEditInpainter
     genai = GenAIEditInpainter(config.get("inpainting", {}))
     img = Image.open(image_path).convert("RGB")
@@ -1224,7 +1457,7 @@ def run_genai_replacement(
         mask_img = Image.fromarray(mask_arr)
 
     for f in floating:
-        img = genai.replace_text_region(img, f, mask=mask_img)
+        img = genai.replace_text_region(img, f, mask=mask_img, render_translation=False)
 
 
     out_path = tmp_dir / f"{page_id}_ko.png"
@@ -1234,53 +1467,9 @@ def run_genai_replacement(
 
 def _build_dialogue_qa_report(page_id: str, detection: dict, final_image: str, config: dict) -> dict:
     """Lightweight QA report focused on speech-bubble dialogue quality."""
-    import re
+    from qa_module import build_dialogue_quality_report
 
-    def has_japanese_chars(text: str) -> bool:
-        return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", str(text)))
-
-    items = []
-    translated_dialogue = 0
-    total_dialogue = 0
-    issues = []
-    for bubble in detection.get("bubbles", []):
-        ocr_text = bubble.get("ocr_text")
-        translation = bubble.get("translation")
-        text_type = bubble.get("text_type", "dialogue")
-        flags = []
-        if text_type == "sfx":
-            flags.append("sfx")
-            if bubble.get("skip_inpaint"):
-                flags.append("preserved")
-        else:
-            total_dialogue += 1
-            if ocr_text and ocr_text != "[NO TEXT]" and not translation:
-                flags.append("missing_translation")
-                issues.append(f"{bubble['id']}: missing translation")
-            else:
-                translated_dialogue += 1
-            if translation and has_japanese_chars(translation):
-                flags.append("japanese_remaining")
-                issues.append(f"{bubble['id']}: Japanese remains")
-        items.append({
-            "id": bubble.get("id"),
-            "type": text_type,
-            "ocr_text": ocr_text,
-            "translation": translation,
-            "skip_inpaint": bool(bubble.get("skip_inpaint")),
-            "bbox": bubble.get("bbox"),
-            "flags": flags,
-        })
-    coverage = (translated_dialogue / total_dialogue * 100) if total_dialogue else 100.0
-    return {
-        "page_id": page_id,
-        "final_image": final_image,
-        "dialogue_coverage": round(coverage, 2),
-        "translated_dialogue": translated_dialogue,
-        "total_dialogue": total_dialogue,
-        "issues": issues,
-        "bubbles": items,
-    }
+    return build_dialogue_quality_report(page_id, detection, final_image)
 
 
 def process_page(image_path: str, config: dict, api_key: str = "",
@@ -1328,9 +1517,10 @@ def process_page(image_path: str, config: dict, api_key: str = "",
                 logger.error(f"[{page_id}] Detection failed: {e}", exc_info=True)
                 return {"page_id": page_id, "status": "error", "step": "detection", "error": str(e)}
 
-            # Step 2: OCR (optional — needs API key)
+            # Step 2: OCR
             ocr_succeeded = False
-            if api_key:
+            ocr_provider = config.get("ocr", {}).get("provider", "openrouter")
+            if _provider_has_credentials(ocr_provider, api_key):
                 try:
                     _progress("ocr", "start")
                     logger.info(f"[{page_id}] === OCR ===")
@@ -1346,7 +1536,8 @@ def process_page(image_path: str, config: dict, api_key: str = "",
 
             # Step 3: Translation (only if OCR succeeded)
             translation_succeeded = False
-            if ocr_succeeded:
+            translation_provider = config.get("translation", {}).get("provider", "openrouter")
+            if ocr_succeeded and _provider_has_credentials(translation_provider, api_key):
                 try:
                     _progress("translation", "start")
                     logger.info(f"[{page_id}] === Translation ===")
@@ -1380,8 +1571,12 @@ def process_page(image_path: str, config: dict, api_key: str = "",
                 try:
                     _progress("typesetting", "start")
                     logger.info(f"[{page_id}] === Typesetting ===")
-                    final_path = run_typesetting(cleaned_path, detection, config, tmp_dir, page_id)
-                    final_path = run_genai_replacement(final_path, detection, config, tmp_dir, page_id)
+                    floating_cleaned_path = run_genai_replacement(
+                        cleaned_path, detection, config, tmp_dir, page_id
+                    )
+                    final_path = run_typesetting(
+                        floating_cleaned_path, detection, config, tmp_dir, page_id
+                    )
                     _progress("typesetting", "done")
                 except Exception as e:
                     _progress("typesetting", "error", {"error": str(e)})
@@ -1435,7 +1630,7 @@ def process_page(image_path: str, config: dict, api_key: str = "",
                         page_translations.append(t)
 
             has_error = len(step_errors) > 0
-            status = "partial" if has_error else "complete"
+            status = "partial" if has_error or qa_report["issues"] else "complete"
 
             partial_note = ""
             if has_error:
@@ -1475,18 +1670,12 @@ def main():
     if args.output:
         config["output"]["base_dir"] = args.output
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        # Try loading from .env
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        api_key = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-    if not api_key:
+    api_key = args.api_key or _load_project_secret("OPENROUTER_API_KEY")
+    providers = {
+        config.get("ocr", {}).get("provider", "openrouter"),
+        config.get("translation", {}).get("provider", "openrouter"),
+    }
+    if not any(_provider_has_credentials(provider, api_key) for provider in providers):
         logger.warning("No API key — skipping OCR and translation (detection + inpainting only)")
 
     results = []

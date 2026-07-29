@@ -1,10 +1,11 @@
 """VLM OCR — crop 단위로 텍스트 읽기 (전체 페이지 X)
-Supports OpenRouter and Google AI Studio providers.
+Supports OpenRouter, Google AI Studio, and Antigravity CLI providers.
 """
 import base64
 import json
 import logging
 import os
+import re
 import threading
 from io import BytesIO
 from typing import Optional
@@ -23,8 +24,9 @@ OCR_SYSTEM_PROMPT = """You are a Japanese manga OCR scanner. You have NO transla
 - For horizontal text: read left-to-right, top-to-bottom
 - Include sound effects (SFX) if any
 - Ignore furigana (ruby annotations) — extract primary text only
-- Ignore repeating dots/commas from background screentones
-- If no text is clearly visible, output exactly: [NO TEXT]"""
+- Preserve an intentional ellipsis or reaction punctuation inside a detected speech balloon
+- Ignore dot-like noise only when it is clearly part of background screentones
+- If the crop is truly blank, output exactly: [NO TEXT]"""
 
 
 class VlmOcr:
@@ -41,6 +43,7 @@ class VlmOcr:
         self._thread_local = threading.local()
         self._api_lock = threading.Lock()
         self.auth_failed = False
+        self._cli_clients = {}
 
     @staticmethod
     def _is_auth_error(resp) -> bool:
@@ -60,6 +63,13 @@ class VlmOcr:
 
     def check_auth(self, api_key: str) -> bool:
         """Return False for OpenRouter auth/key failures so OCR can skip the page."""
+        if self.provider == "antigravity-cli":
+            client = self._get_cli_client(self.model)
+            if not client.available:
+                logger.error("Antigravity CLI OCR requires the 'agy' executable")
+                self.auth_failed = True
+                return False
+            return True
         if self.auth_failed or self.provider == "google-ai-studio":
             return not self.auth_failed
 
@@ -80,6 +90,94 @@ class VlmOcr:
             self._thread_local.auth_failed = True
             return False
         return True
+
+    def _get_cli_client(self, model: str):
+        from antigravity_client import AntigravityCliClient
+
+        client = self._cli_clients.get(model)
+        if client is None:
+            client = AntigravityCliClient(model=model, timeout=180)
+            self._cli_clients[model] = client
+        return client
+
+    @classmethod
+    def _parse_cli_batch(cls, result: Optional[str], expected_ids: set[str]) -> dict[str, Optional[str]]:
+        if not result:
+            return {}
+        cleaned = re.sub(r"```(?:json)?\s*", "", result, flags=re.I)
+        cleaned = re.sub(r"```\s*", "", cleaned)
+        match = re.search(r"\[[\s\S]*\]", cleaned)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+
+        parsed = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            if item_id not in expected_ids:
+                continue
+            text = cls._clean(str(item.get("text") or ""))
+            parsed[item_id] = text or None
+        return parsed
+
+    def _read_cli_batch_with_model(
+        self,
+        crops: list[tuple[str, Image.Image, Optional[str]]],
+        model: str,
+    ) -> dict[str, Optional[str]]:
+        descriptions = [
+            {
+                "id": item_id,
+                "orientation": orientation or "mixed",
+                "file_label": item_id,
+            }
+            for item_id, _, orientation in crops
+        ]
+        prompt = f"""You are a precision Japanese manga OCR engine. Read every supplied crop image itself.
+
+Return a valid JSON array only, in this exact schema:
+[{{"id":"region_id","text":"exact Japanese text or [NO TEXT]"}}]
+
+Rules:
+- Return exactly one object for every requested id, in the same order.
+- Copy only characters visibly present in that crop. Never translate or explain.
+- Preserve kanji, kana, numbers, punctuation, prolonged marks, hearts, and emphasis exactly.
+- Ignore furigana and visual line wrapping; join one utterance into natural reading order.
+- Vertical Japanese reads top-to-bottom and columns right-to-left.
+- Preserve intentional ellipses and reaction punctuation in speech balloons.
+- Use [NO TEXT] when uncertain. Never reconstruct text from memory or another manga.
+
+Requested regions:
+{json.dumps(descriptions, ensure_ascii=False)}"""
+        images = {item_id: crop for item_id, crop, _ in crops}
+        result = self._get_cli_client(model).generate(prompt, images=images)
+        return self._parse_cli_batch(result, {item_id for item_id, _, _ in crops})
+
+    def read_batch(
+        self,
+        crops: list[tuple[str, Image.Image, Optional[str]]],
+    ) -> dict[str, Optional[str]]:
+        """Read multiple isolated crops in one Antigravity subscription call."""
+        if self.provider != "antigravity-cli" or self.auth_failed or not crops:
+            return {}
+
+        parsed = self._read_cli_batch_with_model(crops, self.model)
+        missing = [item for item in crops if item[0] not in parsed]
+        if missing and self.fallback_model:
+            logger.warning(
+                "  Antigravity OCR omitted %d region(s); retrying with %s",
+                len(missing),
+                self.fallback_model,
+            )
+            parsed.update(self._read_cli_batch_with_model(missing, self.fallback_model))
+        return parsed
 
     def _call_api(self, crop: Image.Image, api_key: str, model: str, timeout: int = 30, orientation: Optional[str] = None) -> Optional[str]:
         buf = BytesIO()
@@ -194,6 +292,7 @@ class VlmOcr:
         if not google_key:
             logger.error("No Google API key found — set GOOGLE_API_KEY in .env")
             return None
+
         buf = BytesIO()
         crop.save(buf, format="JPEG", quality=95)
         b64 = base64.b64encode(buf.getvalue()).decode()
@@ -233,8 +332,11 @@ RULES:
                     if self.auth_failed:
                         return None
                     resp = session.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={google_key}",
-                        headers={"Content-Type": "application/json"},
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": google_key,
+                        },
                         json=payload,
                         timeout=timeout,
                     )
@@ -291,6 +393,8 @@ RULES:
         compact = re.sub(r"\s+", "", text)
         if not compact:
             return False
+        if re.fullmatch(r"[.…⋯!！?？~〜～]+", compact) and len(compact) <= 6:
+            return False
         placeholder_chars = set("〇○◯●・。、,.!?！？…◇◆□■▢△▲▽▼○●")
         kana_kanji = re.search(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]", compact)
         if kana_kanji and any(ch not in placeholder_chars and not ch.isdigit() and ch not in "第話歳年ヶ月日" for ch in compact):
@@ -304,6 +408,11 @@ RULES:
         text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.I)
         text = re.sub(r"^(Translation|Korean):\s*", "", text, flags=re.I)
         text = re.sub(r"^\s*\[NO TEXT\]\s*$", "", text, flags=re.I | re.M)
+        if (
+            re.search(r"[〇○◯●◇◆□■▢△▲▽▼]", text)
+            and re.fullmatch(r"[\s〇○◯●◇◆□■▢△▲▽▼.…⋯!！?？~〜～]+", text)
+        ):
+            return ""
         
         # Noise reduction: cap repeating punctuation to max 3 (e.g. ....... -> ...)
         text = re.sub(r'([.、。・…!?,~～/|]){4,}', r'\1\1\1', text)
@@ -312,6 +421,11 @@ RULES:
         # If line contains only symbols/punctuation, it's likely background noise
         lines = text.split("\n")
         cleaned_lines = []
+        has_word_line = any(
+            re.search(r'[a-zA-Z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line)
+            for line in lines
+            if "[NO TEXT]" not in line.upper()
+        )
         leak_markers = (
             "the image",
             "visible text",
@@ -333,6 +447,12 @@ RULES:
             # Check if line has any actual word characters (kanji/kana/alpha)
             if re.search(r'[a-zA-Z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line):
                 cleaned_lines.append(line)
+            elif (
+                not has_word_line
+                and re.fullmatch(r"[.…⋯!！?？~〜～]+", line)
+                and len(line) <= 6
+            ):
+                cleaned_lines.append(line)
                 
         cleaned_text = "\n".join(cleaned_lines).strip()
         if VlmOcr._is_placeholder_text(cleaned_text):
@@ -344,6 +464,8 @@ RULES:
         if self.auth_failed:
             return None
         self._thread_local.auth_failed = False
+        if self.provider == "antigravity-cli":
+            return self.read_batch([("crop", crop, orientation)]).get("crop")
         if self.provider == "google-ai-studio":
             text = self._call_google_api(crop, api_key, self.model, timeout=30, orientation=orientation)
             if self.auth_failed or getattr(self._thread_local, "auth_failed", False):

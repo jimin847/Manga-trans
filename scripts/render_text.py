@@ -21,7 +21,7 @@ logger = logging.getLogger("typeset")
 STYLE_PRESETS = {
     "normal": {
         "base_font_size": 48,
-        "min_font_size": 22,
+        "min_font_size": 14,
         "max_font_size": 72,
         "color": "#000000",
         "stroke_color": "#ffffff",
@@ -79,6 +79,16 @@ STYLE_PRESETS = {
         "font_weight": "Normal",
         "padding": 6,
     },
+    "floating": {
+        "base_font_size": 38,
+        "min_font_size": 22,
+        "max_font_size": 54,
+        "color": "#000000",
+        "stroke_color": "#ffffff",
+        "stroke_width": 10,
+        "font_weight": "Bold",
+        "padding": 0,
+    },
 }
 
 
@@ -102,8 +112,8 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict, prefe
     Iterative font-size calculator that finds the largest size where
     word-wrapped text fits within bbox dimensions.
     """
-    from PyQt5.QtGui import QFont, QFontMetrics, QTextOption
-    from PyQt5.QtCore import Qt, QRectF
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QFont, QFontMetrics, QTextDocument, QTextOption
     from PyQt5.QtWidgets import QApplication
 
     base = preset.get("base_font_size", 48)
@@ -140,40 +150,26 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict, prefe
         mid = (lo + hi) // 2
         font = QFont(font_family, mid)
         font.setWeight(QFont.Bold if preset.get("font_weight") == "Bold" else QFont.Normal)
-        fm = QFontMetrics(font)
+        if "\n" in text:
+            metrics = QFontMetrics(font)
+            lines = text.splitlines() or [text]
+            measured_w = max(metrics.horizontalAdvance(line) for line in lines) + stroke_width * 2
+            measured_h = metrics.lineSpacing() * len(lines) + stroke_width * 2
+        else:
+            option = QTextOption()
+            option.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            document = QTextDocument()
+            document.setDocumentMargin(0)
+            document.setDefaultFont(font)
+            document.setDefaultTextOption(option)
+            document.setPlainText(text)
+            document.setTextWidth(usable_w)
+            measured = document.size()
+            measured_w = measured.width()
+            measured_h = measured.height()
 
-        # Simulate word-wrap: count lines needed
-        line_h = fm.lineSpacing()
-        words = text.replace("\n", " \n ").split()
-
-        total_lines = 0
-        current_w = 0.0
-        for word in words:
-            if word == "\n":
-                total_lines += 1
-                current_w = 0.0
-                continue
-            word_w = fm.horizontalAdvance(word)
-            if total_lines == 0:
-                total_lines = 1
-            if current_w and current_w + fm.horizontalAdvance(" ") + word_w > usable_w:
-                total_lines += 1
-                current_w = word_w
-            else:
-                current_w += word_w + (fm.horizontalAdvance(" ") if current_w else 0)
-        if current_w == 0 and total_lines == 0:
-            total_lines = 1
-
-        needed_h = total_lines * line_h
-
-        # Check if longest individual line fits
-        longest_line = ""
-        for line in text.split("\n"):
-            if len(line) > len(longest_line):
-                longest_line = line
-        longest_w = fm.horizontalAdvance(longest_line)
-
-        if needed_h <= usable_h and longest_w <= usable_w:
+        if measured_h <= usable_h and measured_w <= usable_w:
             best = mid
             lo = mid + 1
         else:
@@ -186,13 +182,51 @@ def calculate_font_size(bbox_w: int, bbox_h: int, text: str, preset: dict, prefe
     return result
 
 
+def calculate_vertical_font_size(
+    bbox_w: int,
+    bbox_h: int,
+    text: str,
+    preset: dict,
+    preferred_font_size: Optional[int] = None,
+) -> int:
+    """Fit multi-column vertical text using the same geometry as the renderer."""
+    from PyQt5.QtGui import QFont, QFontMetrics
+    from PyQt5.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication(["hermes_typeset"])
+    min_fs = preset.get("min_font_size", 28)
+    max_fs = preset.get("max_font_size", 72)
+    if preferred_font_size is not None:
+        max_fs = max(min_fs, min(max_fs, int(preferred_font_size)))
+    margin = preset.get("padding", 10) + preset.get("stroke_width", 5)
+    usable_w = bbox_w - margin * 2
+    usable_h = bbox_h - margin * 2
+    columns = [column for column in text.split("\n") if column.strip()] or [text]
+    max_col_len = max(len(column) for column in columns)
+
+    best = min_fs
+    for size in range(min_fs, max_fs + 1):
+        font = QFont("Apple SD Gothic Neo", size)
+        font.setWeight(QFont.Bold if preset.get("font_weight") == "Bold" else QFont.Normal)
+        metrics = QFontMetrics(font)
+        char_step = max(1, int(metrics.height() * 0.9))
+        col_gap = max(1, int(metrics.horizontalAdvance(" ") * 1.2))
+        measured_w = len(columns) * char_step + max(0, len(columns) - 1) * col_gap
+        measured_h = max_col_len * char_step
+        if measured_w <= usable_w and measured_h <= usable_h:
+            best = size
+        else:
+            break
+    return best
+
+
 def render_text_direct(clean_image_path, typeset_plans, output_png_path):
     """
     Render typeset plans onto cleaned image using QPainter.drawText with
     automatic word-wrap, then tight-crop to actual text bounds.
     """
     from PyQt5.QtGui import QImage, QPainter, QFont, QColor, QPen, QTextOption
-    from PyQt5.QtCore import Qt, QPointF, QRectF
+    from PyQt5.QtCore import Qt, QRectF
     from PyQt5.QtWidgets import QApplication
     from PIL import Image as PILImage
 
@@ -231,8 +265,20 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         style_name = plan.get("style", "normal")
         preset = STYLE_PRESETS.get(style_name, STYLE_PRESETS["normal"])
 
+        # Detected speech-bubble boxes are usually oval or irregular. Keep text in
+        # a narrower centered rectangle so strokes do not touch the curved sides.
+        safe_width_ratio = max(0.5, min(1.0, float(plan.get("safe_width_ratio", 0.82))))
+        safe_bbox_w = max(10, int(bbox_w * safe_width_ratio))
+
         # Font size from iterative binary-search calculator
-        font_size = calculate_font_size(bbox_w, bbox_h, text, preset, plan.get("estimated_font_size"))
+        if plan.get("vertical", False):
+            font_size = calculate_vertical_font_size(
+                safe_bbox_w, bbox_h, text, preset, plan.get("estimated_font_size")
+            )
+        else:
+            font_size = calculate_font_size(
+                safe_bbox_w, bbox_h, text, preset, plan.get("estimated_font_size")
+            )
 
         padding = preset.get("padding", 10)
         stroke_width = preset.get("stroke_width", 5)
@@ -241,25 +287,14 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         font.setWeight(QFont.Bold if preset.get("font_weight") == "Bold" else QFont.Normal)
         font.setStyleHint(QFont.SansSerif)
 
-        # Temp image: intentionally taller than bbox so QPainter never clips long text.
-        # After rendering we tight-crop and scale the actual glyph bounds down if needed.
         margin = stroke_width + padding
-        text_img_w = bbox_w
-        text_img_h = max(bbox_h, int(font_size * 20) + margin * 4)
-
-        text_img = QImage(text_img_w, text_img_h, QImage.Format_ARGB32)
-        text_img.fill(Qt.transparent)
-
-        tp = QPainter(text_img)
-        tp.setRenderHint(QPainter.Antialiasing)
-        tp.setRenderHint(QPainter.TextAntialiasing)
-        tp.setFont(font)
-
-        # The text rect should be WIDE enough that text doesn't wrap unnecessarily,
-        # but we'll measure actual bounds after rendering
-        text_rect = QRectF(margin, margin,
-                          text_img_w - margin * 2,
-                          text_img_h - margin * 2)
+        safe_x1 = x1 + (bbox_w - safe_bbox_w) / 2
+        text_rect = QRectF(
+            safe_x1 + margin,
+            y1 + margin,
+            max(1, safe_bbox_w - margin * 2),
+            max(1, bbox_h - margin * 2),
+        )
 
         # Stroke
         stroke_color = QColor(preset.get("stroke_color", "#ffffff"))
@@ -270,44 +305,20 @@ def render_text_direct(clean_image_path, typeset_plans, output_png_path):
         fill_color = QColor(preset.get("color", "#000000"))
 
         if plan.get("vertical", False):
-            _render_vertical_text(tp, text_rect, text, font, stroke_pen, fill_color)
+            _render_vertical_text(main_painter, text_rect, text, font, stroke_pen, fill_color)
         else:
-            # Configure drawText for auto word-wrap + center alignment
             option = QTextOption()
-            option.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            option.setWrapMode(QTextOption.WrapMode.NoWrap)
+            option.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
 
             # Stroke pass
-            tp.setPen(stroke_pen)
-            tp.drawText(text_rect, text, option)
+            main_painter.setFont(font)
+            main_painter.setPen(stroke_pen)
+            main_painter.drawText(text_rect, text, option)
 
             # Fill pass
-            tp.setPen(fill_color)
-            tp.drawText(text_rect, text, option)
-
-        tp.end()
-
-        # Tight crop: scan for non-transparent pixels
-        cropped = _crop_transparent(text_img, stroke_width)
-        if cropped is None:
-            logger.warning(f"  Typeset {plan.get('id', '?')}: empty text, skipping")
-            continue
-
-        crop_w = cropped.width()
-        crop_h = cropped.height()
-
-        # Downscale if exceeds bbox dimensions
-        if crop_w > bbox_w or crop_h > bbox_h:
-            scale = min(bbox_w / crop_w, bbox_h / crop_h)
-            new_w = max(1, int(crop_w * scale))
-            new_h = max(1, int(crop_h * scale))
-            cropped = cropped.scaled(new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            crop_w, crop_h = new_w, new_h
-
-        # Center the cropped text in the bbox on main image
-        dest_x = x1 + (bbox_w - crop_w) // 2
-        dest_y = y1 + (bbox_h - crop_h) // 2
-        main_painter.drawImage(QPointF(dest_x, dest_y), cropped)
+            main_painter.setPen(fill_color)
+            main_painter.drawText(text_rect, text, option)
 
         logger.info(f"  Typeset {plan.get('id', '?')} ({style_name}, {font_size}pt, {bbox_w}x{bbox_h}): '{text[:40]}'")
 

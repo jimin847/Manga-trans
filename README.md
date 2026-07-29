@@ -1,77 +1,103 @@
-# Manga-trans (v2)
+# Manga-trans
 
-일본어 만화(망가) 이미지 파일을 한국어로 자동 번역하고 식자(Typeset)하는 엔드투엔드(End-to-End) 자동화 파이프라인 프로젝트입니다.
+일본어 만화 이미지를 감지, OCR, 한국어 번역, 독립 편집 검수, 원문 제거, 식자까지 처리하는 macOS 중심 파이프라인입니다.
 
-> 💡 **프로젝트 안내**  
-> 본 프로젝트는 개발용 AI 에이전트인 **Hermes-agent**와의 긴밀한 협업을 통해 제작되었습니다. 전체 아키텍처 기획 및 요구 사항(사양서)을 정의한 뒤, AI 에이전트가 코드를 빌드하고 디버깅하는 과정을 거쳐 완성되었습니다.
+이 프로젝트의 우선순위는 단순한 자동 완료율이 아니라 **번역 정확도와 원화 보존**입니다. 확실하지 않은 OCR·번역·리드로우 결과는 성공으로 숨기지 않고 `needs_review`로 남깁니다.
 
----
+## 현재 상태
 
-## 🛠️ 핵심 파이프라인 아키텍처
+| 영역 | 기본 동작 | 상태 |
+|---|---|---|
+| 감지 | YOLO 말풍선·텍스트 분리 감지, 1280px 추론 | 자동 |
+| OCR | tight/context 두 시야를 Gemini로 판독하고 합의 검사 | 자동 + 불일치 검수 |
+| 번역 | Gemini 3.1 Pro 초벌, Claude Sonnet 독립 편집 검수 | 자동 + 완결성 검사 |
+| 원문 제거 | 평탄한 흰 말풍선만 안전하게 제거 | 자동 |
+| 복잡한 배경 | 망점·삽화·외부 글자는 원본 보존 | 수동 리드로우 필요 |
+| 식자 | 실제 글꼴 메트릭 기반 크기 탐색과 문장부호 인접 줄바꿈 | 자동 |
 
-본 프로젝트는 다음과 같은 유기적인 흐름으로 만화 원서 이미지를 자동 번역합니다.
+현재 회귀 테스트는 `101 passed`입니다. 비공개 3페이지 개발 벤치마크에서는 일반 말풍선 페이지가 완전 통과했고, 복잡한 배경이 포함된 2페이지는 원화 보호 정책에 따라 부분 완료로 판정됩니다.
 
-```
-[입력 이미지]
-      │
-      ▼
-1. YOLO 감지 ───────► (텍스트 영역 및 말풍선 Bbox 좌표 검출)
-      │
-      ▼
-2. 하이브리드 지우기  ► (일반 흰 배경: Flat Fill 처리)
-      │               (스크린톤/복잡 배경: ComfyUI LaMa Inpainting API 호출)
-      ▼
-3. VLM 병렬 OCR ────► (YOLO로 크롭된 영역을 OpenRouter Qwen3-VL에 보내 4병렬 OCR 추출)
-      │
-      ▼
-4. 문맥 기반 번역 ──► (전후 페이지 흐름을 담아 OpenRouter LLM(GPT-120B / Gemini)으로 번역)
-      │
-      ▼
-5. PyQt5 자동 식자 ──► (QPainter 및 QFontMetrics를 활용, 이진 탐색으로 폰트 크기 최적화 배치)
-      │
-      ▼
-[최종 번역 완료 이미지]
+## 처리 흐름
+
+```text
+입력 이미지
+  → YOLO 영역 감지
+  → tight/context 합의형 OCR
+  → 페이지 순서·이전 문맥 기반 번역
+  → 독립 편집 검수 및 완결성 검사
+  → 원화 보호 게이트
+  → PyQt5 자동 식자
+  → 번역 이미지 + 영역별 QA 보고서
 ```
 
----
+주요 품질 장치:
 
-## 🌟 주요 특징 (v2 개선 사항)
+- OCR 두 시야가 일치하지 않으면 자동 승인하지 않습니다.
+- 긴 대사의 누락, 종결 문장부호 손실, 일본어 잔존, 잘못된 혼합 고어체를 검사합니다.
+- `…`처럼 번역할 필요가 없는 반응 문장부호는 원본 그대로 보존합니다.
+- 번역이 승인되지 않은 영역은 원문을 지우지 않습니다.
+- 망점이나 그림 위 텍스트는 검증되지 않은 인페인팅으로 원화를 훼손하지 않습니다.
+- 결과마다 `*_dialogue_qa.json`을 만들어 미완료 영역을 명시합니다.
 
-* **하이브리드 인페인팅**: 연산 효율을 위해 일반 말풍선은 로컬 수학 연산(Flat fill)으로 즉시 채우고, 복잡한 배경에만 무거운 AI 이미지 인페인팅(LaMa) 모델을 호출하도록 구성하여 처리 속도를 높였습니다.
-* **CacheManager 탑재**: 동일 이미지 크롭 해시(MD5)와 번역 텍스트 해시를 관리하여 중복되는 API 요청을 최소화하고 요금을 최적화합니다.
-* **문맥 유지(Context Continuity)**: 배치 처리 시 이전 페이지 대사의 문맥을 큐(Queue) 형식으로 유지하여 끊김 없이 매끄러운 번역을 수행합니다.
-* **지능형 자동 식자 엔진**: 말풍선 Bbox 너비와 높이에 맞춰 줄바꿈을 포함한 최적의 폰트 크기(22~72pt)를 이진 탐색 알고리즘으로 자동 계산하여 최적의 가독성을 구현합니다.
-* **중단 없는 안정적 배치**: `--resume` 및 `--skip-existing` 플래그를 통해 API 할당량 초과 등으로 인한 작업 중단 시 기존 성공 지점부터 다시 진행할 수 있습니다.
+## 요구 사항
 
----
+- macOS 및 Python 3.10+
+- PyQt5, Pillow, PyYAML, NumPy, SciPy, OpenCV, Ultralytics
+- Google Antigravity CLI (`agy`)와 로그인된 Google 계정
+- 로컬 감지 모델:
+  - `models/manga-text-segmenter-yolov26s.pt`
+  - `models/manga109-speech-bubble-yolo11n.pt`
+- 선택 사항: `models/lama.onnx`
 
-## ⚙️ 시스템 요구사항 및 구성
+대용량 모델 파일은 Git에 포함하지 않습니다. 모델은 실행 환경에서 별도로 설치하며 `MODELS_ROOT`로 외부 모델 디렉터리를 지정할 수 있습니다.
 
-* **Language**: Python 3.10+
-* **Dependencies**: PyQt5, Pillow, PyYAML, Scipy, Ultralytics (YOLO)
-* **External Services**: 
-  - **ComfyUI Server** (LaMa Inpainting REST API, default `port 8188`)
-  - **OpenRouter API Key** (Gemma, Qwen, GPT-OSS 등 무료/유료 VLM 및 LLM 호출용)
-
----
-
-## 🚀 실행 방법
-
-### 1. 단일 페이지 실행
-```bash
-python3 main.py [입력이미지경로] --output [결과물출력디렉토리]
-```
-
-### 2. 폴더 내 이미지 일괄 배치 실행 (Docker 기반)
-`translate_all.sh` 스크립트를 사용하여 대량의 폴더를 일괄 처리할 수 있습니다.
+### Antigravity CLI
 
 ```bash
-# OpenRouter API 키를 환경 변수로 등록 후 실행
-export OPENROUTER_API_KEY="your_api_key_here"
-bash translate_all.sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy
 ```
 
----
+기본 `config.yaml`은 로그인된 Antigravity 세션을 사용합니다. provider를 `openrouter` 또는 `google-ai-studio`로 변경한 경우에만 해당 API 키가 필요합니다.
 
-## ⚖️ 저작권 및 면책 조항
-본 저장소에는 저작권이 있는 만화 본문 이미지 및 번역 결과물은 포함되어 있지 않으며, 오직 이미지 처리 및 파이프라인 자동화 실행 코드만 제공됩니다.
+## 실행
+
+단일 페이지:
+
+```bash
+python3 main.py '/path/to/page.jpg' --output output
+```
+
+여러 페이지:
+
+```bash
+python3 run_batch.py --resume --skip-existing '/path/to/chapter/*.jpg'
+```
+
+주요 결과물:
+
+- `output/<page>_ko.png`: 최종 이미지
+- `output/<page>_dialogue_qa.json`: OCR·번역·렌더링 상태
+- `output/cache.json`: 버전이 포함된 OCR·번역 캐시
+
+## 검증
+
+```bash
+pytest -q
+python3 scripts/quality_benchmark.py \
+  --gold benchmarks/yappari_v01/gold.json \
+  --results-dir output \
+  --source-dir '/path/to/private/source'
+```
+
+벤치마크에는 저작권 이미지 대신 파일명, SHA-256, 기대 OCR·번역 조건만 저장합니다. 구현 및 품질 기준은 [전문 품질 파이프라인 문서](docs/research/PROFESSIONAL_QUALITY_PIPELINE.md)에 정리되어 있습니다.
+
+## 알려진 한계
+
+- 망점 말풍선과 삽화 위 세로 대사는 현재 자동 리드로우 대상이 아닙니다.
+- LaMa와 단순 knockout은 원화를 훼손하거나 흰 잔상을 만들 수 있어 기본값에서 비활성화되어 있습니다.
+- 자동 QA 통과만으로 출판 품질을 보증하지 않습니다. 최종 배포 전 일본어·한국어 검수와 페이지 시각 검수가 필요합니다.
+
+## 저작권
+
+저장소에는 저작권이 있는 만화 원본이나 생성된 번역 이미지가 포함되지 않습니다. 사용자는 처리 대상 콘텐츠의 권리와 해당 지역 법률을 준수해야 합니다.

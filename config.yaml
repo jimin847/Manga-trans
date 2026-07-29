@@ -14,23 +14,28 @@ yolo:
   conf_threshold: 0.20
   iou_threshold: 0.55
   device: "mps"  # m1 GPU
+  detection_size: 1280  # text checkpoint training/inference resolution
 
 ocr:
-  provider: "openrouter"
-  model: "google/gemma-4-31b-it:free"
-  fallback_model: "google/gemma-4-31b-it:free"
+  provider: "antigravity-cli"
+  model: "gemini-3.6-flash-high"
+  fallback_model: "gemini-3.1-pro-high"
   crop_upscale: 2
   text_mask_margin: 8
-  max_workers: 4
+  multi_view: true
+  batch_max_items: 12
+  max_workers: 1
 
 translation:
-  provider: "openrouter"
-  model: "openai/gpt-oss-120b:free"
-  fallback_model: "openai/gpt-oss-120b:free"
+  provider: "antigravity-cli"
+  model: "gemini-3.1-pro-high"
+  review_model: "claude-sonnet-4-6"
   target_lang: "ko"
   preserve_terms: []
   glossary: {}
   translate_sfx: false
+  batch_max_items: 12
+  quality_review: true
 
 typesetting:
   target_font_size: 42
@@ -40,18 +45,28 @@ typesetting:
   bubble_padding: 10
   skip_sfx: true
   line_planning_scale: 0.65
-  max_chars_per_line: 6
+  max_chars_per_line: 7
+  safe_width_ratio: 0.82
+  floating_safe_width_ratio: 0.95
+  floating_padding: 2
+  vertical_korean: false
+  vertical_floating_korean: true
 
 inpainting:
   backend: "lama_onnx"  # Options: "lama_onnx", "opencv", "genai_edit", "comfyui", "local_diffusers"
   model_path: "models/lama.onnx"
   genai_provider: "lama_onnx"  # Options: "lama_onnx", "local_diffusers", "openrouter"
+  floating_text_strategy: "preserve"  # 원화와 겹친 외부 글자는 자동 훼손 대신 검수 대기
 
 
 
   genai_prompt_erase: "Erase the Japanese text from this manga crop completely and reconstruct the underlying drawing style, lines, and screentones seamlessly without any smudging."
   genai_prompt_replace: "Replace the Japanese text inside this manga crop with the following Korean translation: '{target_text}'. Maintain the exact illustration style, background artwork, and dynamic manga typography aesthetics."
   flat_fill: true  # 흰 말풍선은 flat fill (fast)
+  preserve_textured_bubbles: true
+  flat_background_inset_ratio: 0.15
+  flat_background_min_median: 210
+  flat_background_min_bright_ratio: 0.80
   lama_fallback: true  # 톤 말풍선은 LaMa 인페인팅
   opencv_fallback: true
   opencv_radius: 2
@@ -66,7 +81,16 @@ inpainting:
   text_threshold_min_component: 2
   text_threshold_max_component: 900
   text_threshold_dilate: 1
+  text_threshold_support_dilate: 4
   threshold_global_mask: false
+  floating_text_min_component: 8
+  floating_text_max_component: 1200
+  floating_text_max_component_width: 64
+  floating_text_max_component_height: 72
+  floating_text_max_mask_ratio: 0.55
+  floating_text_halo_dilate: 6
+  floating_text_knockout_dilate: 1
+  floating_text_composite_dilate: 4
 
 output:
   debug_overlay: true

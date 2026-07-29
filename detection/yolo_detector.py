@@ -46,12 +46,14 @@ class YoloDetector:
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         device: str = "mps",
+        image_size: int = 1280,
     ):
         self.text_model = YOLO(text_segmenter_path)
         self.bubble_model = YOLO(bubble_detector_path)
         self.conf = conf_threshold
         self.iou = iou_threshold
         self.device = device
+        self.image_size = image_size
 
         # 다중 클래스 모델(예: frame, text, balloon) 사용 시 text 클래스만 추출
         self.text_classes = None
@@ -70,6 +72,7 @@ class YoloDetector:
             conf=self.conf,
             iou=self.iou,
             device=self.device,
+            imgsz=self.image_size,
         )
         br = bubble_results[0]
 
@@ -96,6 +99,7 @@ class YoloDetector:
             "conf": self.conf,
             "iou": self.iou,
             "device": self.device,
+            "imgsz": self.image_size,
             "retina_masks": True,
         }
         if self.text_classes is not None:

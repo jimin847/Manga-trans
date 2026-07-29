@@ -49,6 +49,7 @@ class GenAIEditInpainter(BaseInpainter):
         image: Image.Image,
         item: dict,
         mask: Optional[Image.Image] = None,
+        render_translation: bool = True,
     ) -> Image.Image:
         trans = item.get("translation")
         if not trans:
@@ -78,7 +79,10 @@ class GenAIEditInpainter(BaseInpainter):
 
         # 2. Local Standalone GenAI Simulation / Diffusion Erasure + Outline Typography
         try:
-            if self.provider in ("local_diffusers", "diffusers", "sd_inpaint"):
+            strategy = str(self.config.get("floating_text_strategy", "inpaint")).lower()
+            if strategy == "knockout":
+                inpainter = None
+            elif self.provider in ("local_diffusers", "diffusers", "sd_inpaint"):
                 from .diffusers_inpainter import LocalDiffusersInpainter
                 inpainter = LocalDiffusersInpainter(self.config)
             else:
@@ -102,72 +106,126 @@ class GenAIEditInpainter(BaseInpainter):
                         yolo_dilated = cv2.dilate(yolo_crop_mask, kernel_yolo, iterations=2)
                         stroke_mask = cv2.bitwise_and(stroke_mask, yolo_dilated)
 
+                # Floating text often overlaps faces, clothing, and panel line art.
+                # Remove glyph-sized components only; a broad dark component is
+                # much more likely to be artwork than lettering.
+                component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    (stroke_mask > 0).astype(np.uint8), connectivity=8
+                )
+                filtered = np.zeros_like(stroke_mask)
+                min_area = int(self.config.get("floating_text_min_component", 8))
+                max_area = int(self.config.get("floating_text_max_component", 1200))
+                max_width = int(self.config.get("floating_text_max_component_width", 64))
+                max_height = int(self.config.get("floating_text_max_component_height", 72))
+                for component_id in range(1, component_count):
+                    x, y, width, height, area = stats[component_id]
+                    if (
+                        min_area <= area <= max_area
+                        and width <= max_width
+                        and height <= max_height
+                    ):
+                        filtered[labels == component_id] = 255
+                stroke_mask = filtered
+
                 kernel = np.ones((3, 3), np.uint8)
                 stroke_mask = cv2.morphologyEx(stroke_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
                 stroke_mask = cv2.dilate(stroke_mask, kernel, iterations=1)
-                if np.max(stroke_mask) == 0 or (np.sum(stroke_mask > 0) / roi_gray.size) > 0.85:
-                    if mask is not None:
-                        crop_mask_arr = np.array(mask.crop((cx1, cy1, cx2, cy2)).convert("L"))
-                    else:
-                        crop_mask_arr[ry1:ry2, rx1:rx2] = 255
-                else:
-                    crop_mask_arr[ry1:ry2, rx1:rx2] = stroke_mask
+                mask_ratio = np.sum(stroke_mask > 0) / roi_gray.size
+                max_ratio = float(self.config.get("floating_text_max_mask_ratio", 0.35))
+                if np.max(stroke_mask) == 0 or mask_ratio > max_ratio:
+                    logger.warning(
+                        "  [Floating Text] Unsafe mask for %s (%.1f%%); preserving source artwork",
+                        item.get("id", "N/A"),
+                        mask_ratio * 100,
+                    )
+                    return image
+                if strategy != "knockout":
+                    halo_dilate = int(self.config.get("floating_text_halo_dilate", 6))
+                    if halo_dilate > 0:
+                        stroke_mask = cv2.dilate(stroke_mask, kernel, iterations=halo_dilate)
+                crop_mask_arr[ry1:ry2, rx1:rx2] = stroke_mask
             crop_mask = Image.fromarray(crop_mask_arr)
 
+            crop_arr = np.asarray(crop_img.convert("RGB"))
+            if strategy == "knockout":
+                # Floating manga lettering already has a white outline that
+                # occludes the underlying art. Whiten only the dark glyph core;
+                # this removes Japanese without inventing or deleting artwork.
+                knockout_mask = cv2.dilate(
+                    crop_mask_arr,
+                    np.ones((3, 3), np.uint8),
+                    iterations=int(self.config.get("floating_text_knockout_dilate", 1)),
+                )
+                erased_arr = np.array(crop_arr, copy=True)
+                erased_arr[knockout_mask > 0] = (255, 255, 255)
+                erased_crop = Image.fromarray(erased_arr)
+            else:
+                # Run inpainting backend on the crop to reconstruct background artwork / screentones
+                erased_crop = inpainter.inpaint(crop_img, crop_mask)
 
-            # Run inpainting backend on the crop to reconstruct background artwork / screentones
-            erased_crop = inpainter.inpaint(crop_img, crop_mask)
+                # Some image models alter unmasked pixels. Composite only the local
+                # glyph mask back onto the authoritative source crop.
+                composite_mask = cv2.dilate(
+                    crop_mask_arr,
+                    np.ones((3, 3), np.uint8),
+                    iterations=int(self.config.get("floating_text_composite_dilate", 4)),
+                )
+                erased_arr = np.asarray(erased_crop.convert("RGB"))
+                erased_crop = Image.fromarray(
+                    np.where(composite_mask[:, :, None] > 0, erased_arr, crop_arr).astype(np.uint8)
+                )
 
 
             # Render Korean typography onto erased crop
-            draw = ImageDraw.Draw(erased_crop)
-            box_h = ry2 - ry1
-            box_w = rx2 - rx1
+            if render_translation:
+                draw = ImageDraw.Draw(erased_crop)
+                box_h = ry2 - ry1
+                box_w = rx2 - rx1
 
-            is_vertical = item.get("type", "") == "vertical" or (box_h > box_w * 1.3 and len(trans) > 2)
-            if is_vertical:
-                clean_trans = trans.replace("\n", " ").strip()
-                char_count = max(1, len(clean_trans))
-                font_size = max(14, min(box_w, int(box_h / char_count * 0.9)))
-                font = self._get_font(font_size)
-                char_spacing = int(font_size * 1.1)
-                total_h = len(clean_trans) * char_spacing
-                start_y = ry1 + max(0, (box_h - total_h) // 2)
-                start_x = rx1 + max(0, (box_w - font_size) // 2)
-                stroke_w = max(1, font_size // 14)
-                for i, char in enumerate(clean_trans):
-                    cw = draw.textlength(char, font=font)
-                    cx = start_x + max(0, (font_size - cw) / 2)
-                    cy = start_y + i * char_spacing
-                    draw.text((cx, cy), char, font=font, fill=(20, 20, 20), stroke_width=stroke_w, stroke_fill=(255, 255, 255))
-            else:
-                char_count = max(1, len(trans))
-                font_size = max(14, min(box_h, int((box_w * box_h / char_count) ** 0.5 * 0.85)))
-                font = self._get_font(font_size)
-
-                lines = []
-                words = trans.split()
-                cur_line = ""
-                for w in words:
-                    test_line = f"{cur_line} {w}".strip() if cur_line else w
-                    if draw.textlength(test_line, font=font) <= box_w or not cur_line:
-                        cur_line = test_line
-                    else:
-                        lines.append(cur_line)
-                        cur_line = w
-                if cur_line:
-                    lines.append(cur_line)
-
-                line_spacing = int(font_size * 1.2)
-                total_h = len(lines) * line_spacing
-                start_y = ry1 + max(0, (box_h - total_h) // 2)
-
-                for i, line in enumerate(lines):
-                    lw = draw.textlength(line, font=font)
-                    lx = rx1 + max(0, (box_w - lw) / 2)
-                    ly = start_y + i * line_spacing
+                is_vertical = item.get("type", "") == "vertical" or (box_h > box_w * 1.3 and len(trans) > 2)
+                if is_vertical:
+                    clean_trans = trans.replace("\n", " ").strip()
+                    char_count = max(1, len(clean_trans))
+                    font_size = max(14, min(box_w, int(box_h / char_count * 0.9)))
+                    font = self._get_font(font_size)
+                    char_spacing = int(font_size * 1.1)
+                    total_h = len(clean_trans) * char_spacing
+                    start_y = ry1 + max(0, (box_h - total_h) // 2)
+                    start_x = rx1 + max(0, (box_w - font_size) // 2)
                     stroke_w = max(1, font_size // 14)
-                    draw.text((lx, ly), line, font=font, fill=(20, 20, 20), stroke_width=stroke_w, stroke_fill=(255, 255, 255))
+                    for i, char in enumerate(clean_trans):
+                        cw = draw.textlength(char, font=font)
+                        cx = start_x + max(0, (font_size - cw) / 2)
+                        cy = start_y + i * char_spacing
+                        draw.text((cx, cy), char, font=font, fill=(20, 20, 20), stroke_width=stroke_w, stroke_fill=(255, 255, 255))
+                else:
+                    char_count = max(1, len(trans))
+                    font_size = max(14, min(box_h, int((box_w * box_h / char_count) ** 0.5 * 0.85)))
+                    font = self._get_font(font_size)
+
+                    lines = []
+                    words = trans.split()
+                    cur_line = ""
+                    for w in words:
+                        test_line = f"{cur_line} {w}".strip() if cur_line else w
+                        if draw.textlength(test_line, font=font) <= box_w or not cur_line:
+                            cur_line = test_line
+                        else:
+                            lines.append(cur_line)
+                            cur_line = w
+                    if cur_line:
+                        lines.append(cur_line)
+
+                    line_spacing = int(font_size * 1.2)
+                    total_h = len(lines) * line_spacing
+                    start_y = ry1 + max(0, (box_h - total_h) // 2)
+
+                    for i, line in enumerate(lines):
+                        lw = draw.textlength(line, font=font)
+                        lx = rx1 + max(0, (box_w - lw) / 2)
+                        ly = start_y + i * line_spacing
+                        stroke_w = max(1, font_size // 14)
+                        draw.text((lx, ly), line, font=font, fill=(20, 20, 20), stroke_width=stroke_w, stroke_fill=(255, 255, 255))
 
 
             result = image.copy()
